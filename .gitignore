@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+data/
+*.pyc
+*.xml
+/data_unified
+/logs
+*.key
+chats.sqlite*
+tokens.sqlite*
+*.zip
