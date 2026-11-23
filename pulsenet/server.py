@@ -539,10 +539,6 @@ def _status(h, _b, _q):
     h.send_json(h.app.status())
 
 
-def _health(h, _b, _q):
-    h.send_json({"ok": True, "backend": h.app.backend.name})
-
-
 def _scope_id(h, value: str) -> str:
     """Ключ чата/сессии памяти с префиксом пользователя (при включённом входе)."""
     uid = getattr(h, "uid", None)
@@ -842,9 +838,8 @@ _SETTING_BOOLS = ("compact", "autoScroll", "enterSends", "showReasoning", "webSe
 _SETTING_STRINGS = ("fontSize", "model", "ttsVoice")
 
 
-def _clean_settings(b):
+def _clean_settings(b, check_voice=None):
     """Не доверяем телу запроса: храним только известные поля и разумные значения."""
-    from .tts import normalize_speaker
     out = {}
     for key in _SETTING_BOOLS:
         if key in b:
@@ -855,10 +850,13 @@ def _clean_settings(b):
     if "fontSize" in out and out["fontSize"] not in ("s", "m", "l"):
         out["fontSize"] = "m"
     if out.get("ttsVoice"):
-        try:
-            out["ttsVoice"] = normalize_speaker(out["ttsVoice"])
-        except ValueError:
-            out["ttsVoice"] = ""
+        out["ttsVoice"] = out["ttsVoice"][:200]
+        # Голос проверяет движок: Silero и Piper знают список заранее
+        if check_voice is not None:
+            try:
+                out["ttsVoice"] = check_voice(out["ttsVoice"])
+            except ValueError:
+                out["ttsVoice"] = ""
     if "updatedAt" in b:
         try:
             out["updatedAt"] = int(b["updatedAt"])
@@ -876,7 +874,7 @@ def _settings_get(h, _b, _q):
 def _settings_put(h, b, _q):
     if h.settings_store is None:
         return h.send_json({"error": "серверное хранилище настроек недоступно"}, 503)
-    data, updated = h.settings_store.put(h.storage_uid(), _clean_settings(b))
+    data, updated = h.settings_store.put(h.storage_uid(), _clean_settings(b, h.app.tts.normalize_speaker))
     h.send_json({"settings": data, "updated": updated, "updatedAt": data.get("updatedAt", 0)})
 
 
@@ -895,12 +893,12 @@ def _tts_segments(h, b, _q):
 
 def _tts_speak(h, b, _q):
     """Одна фраза → WAV. Голос передаётся в запросе, ошибки — 503 с понятной причиной."""
-    from .tts import TTSError, normalize_speaker
+    from .tts import TTSError
     text = str(b.get("text") or "").strip()
     if not text:
         raise ValueError("пустой текст для озвучки")
     raw = b.get("speaker")
-    speaker = normalize_speaker(raw) if raw not in (None, "") else None
+    speaker = h.app.tts.normalize_speaker(raw) if raw not in (None, "") else None
     try:
         data = h.app.tts.synth(text, speaker)
     except TTSError as exc:

@@ -39,7 +39,8 @@ def _free_port():
 
 @pytest.fixture
 def server(tmp_path):
-    env = {"LLM_BACKEND": "lmstudio", "TRIPLEX_EXTRACT": "0", "AUTH_DISABLED": "1"}
+    # Проверка голоса при сохранении относится к Silero (его список известен заранее)
+    env = {"LLM_BACKEND": "lmstudio", "TRIPLEX_EXTRACT": "0", "AUTH_DISABLED": "1", "TTS_ENGINE": "silero"}
     app = App(env, data_dir=str(tmp_path / "data"))
     port = _free_port()
     srv = make_server(app, "127.0.0.1", port, web_dir=os.path.join(

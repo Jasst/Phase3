@@ -78,7 +78,7 @@ def test_disabled_by_default_and_reports_status(tmp_path):
 
 
 def test_missing_model_gives_clear_message_without_download(tmp_path):
-    tts = SileroTTS({"SILERO_ENABLED": "1"}, str(tmp_path))
+    tts = SileroTTS({"SILERO_ENABLED": "1", "TTS_ENGINE": "silero"}, str(tmp_path))
     with pytest.raises(TTSError) as exc:
         tts.load()
     assert "SILERO_AUTODOWNLOAD" in str(exc.value)
@@ -93,14 +93,16 @@ def test_unknown_speaker_falls_back_to_default(tmp_path):
 class _StubModel:
     def __init__(self):
         self.calls = []
+        self.kwargs = []
 
-    def apply_tts(self, text, speaker, sample_rate):
+    def apply_tts(self, text, speaker, sample_rate, put_accent=False, put_yo=False):
         self.calls.append((text, speaker, sample_rate))
+        self.kwargs.append({"put_accent": put_accent, "put_yo": put_yo})
         return np.zeros(sample_rate // 10, dtype=np.float32)   # 0.1 с тишины
 
 
 def _stub_tts(tmp_path, **env):
-    tts = SileroTTS({"SILERO_ENABLED": "1", **env}, str(tmp_path))
+    tts = SileroTTS({"SILERO_ENABLED": "1", "TTS_ENGINE": "silero", **env}, str(tmp_path))
     tts._model = _StubModel()
     return tts
 
@@ -129,7 +131,7 @@ def test_synth_rejects_unknown_voice(tmp_path):
 
 
 def test_status_exposes_voices_with_previews(tmp_path):
-    tts = SileroTTS({"SILERO_ENABLED": "1"}, str(tmp_path))
+    tts = SileroTTS({"SILERO_ENABLED": "1", "TTS_ENGINE": "silero"}, str(tmp_path))
     voices = tts.status()["voices"]
     assert {v["id"] for v in voices} == set(SPEAKERS_RU)
     assert all(v.get("label") and v.get("preview") for v in voices)
@@ -154,7 +156,7 @@ def test_synth_error_becomes_tts_error(tmp_path):
 
 
 def test_status_available_ignores_lazy_loading_but_shows_errors(tmp_path):
-    tts = SileroTTS({"SILERO_ENABLED": "1"}, str(tmp_path))
+    tts = SileroTTS({"SILERO_ENABLED": "1", "TTS_ENGINE": "silero"}, str(tmp_path))
     assert tts.status()["ready"] is False            # модель ещё не грузилась
     assert tts.status()["available"] is False        # файла нет и автозагрузка выключена
     tts.autodownload = True
@@ -177,7 +179,7 @@ def _free_port():
 @pytest.fixture
 def server(tmp_path, monkeypatch):
     env = {"LLM_BACKEND": "lmstudio", "TRIPLEX_EXTRACT": "0", "TRIPLEX_MEMORY": "1",
-           "AUTH_DISABLED": "1", "SILERO_ENABLED": "1",
+           "AUTH_DISABLED": "1", "SILERO_ENABLED": "1", "TTS_ENGINE": "silero",
            "AGENT_WORKSPACE_DIR": str(tmp_path / "data_unified")}
     app = App(env, data_dir=str(tmp_path / "data"))
     app.tts._model = _StubModel()
@@ -261,6 +263,19 @@ def test_speak_route_unavailable_is_503_not_crash(tmp_path):
 
 def test_default_model_path_is_next_to_agent_data(tmp_path):
     env = {"AGENT_WORKSPACE_DIR": str(tmp_path / "data_unified"), "LLM_BACKEND": "lmstudio",
-           "TRIPLEX_EXTRACT": "0", "AUTH_DISABLED": "1"}
+           "TRIPLEX_EXTRACT": "0", "AUTH_DISABLED": "1", "TTS_ENGINE": "silero"}
     app = App(env, data_dir=str(tmp_path / "data"))
     assert app.tts.model_path == os.path.join(str(tmp_path / "data_unified"), "tts", "v4_ru.pt")
+
+
+def test_synth_asks_silero_for_stress_and_yo(tmp_path):
+    tts = _stub_tts(tmp_path)
+    tts.synth("Всё готово, ёлка горит.")
+    assert tts._model.kwargs == [{"put_accent": True, "put_yo": True}]
+
+
+def test_speech_reads_common_symbols_as_words():
+    from pulsenet.tts import clean_for_speech
+    out = clean_for_speech("Рост 15% и цена 300 ₽ — №5 & кто-то")
+    assert "процентов" in out and "рублей" in out and "номер" in out and " и " in out
+    assert "%" not in out and "₽" not in out and "&" not in out and "№" not in out

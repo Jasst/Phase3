@@ -52,7 +52,7 @@ Alpha. Около 300 тестов (`pytest`). Работает основной
 - [docs/MCP.md](docs/MCP.md) — MCP-сервер: подключение клиентов, токены, инструменты, ошибки.
 - [AGENTS.md](AGENTS.md) — правила работы агента с памятью (для opencode и других клиентов).
 - [docs/AGENT_WORKSPACE.md](docs/AGENT_WORKSPACE.md) — навыки и заметки агента чата.
-- [docs/TTS_SILERO.md](docs/TTS_SILERO.md) — озвучка ответов.
+- [docs/TTS.md](docs/TTS.md) — озвучка: движки Piper и Silero, настройка, голоса.
 - [eval/README.md](eval/README.md) — проверки качества поиска.
 - [ROADMAP.md](ROADMAP.md) — открытые задачи.
 

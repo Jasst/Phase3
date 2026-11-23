@@ -11,5 +11,3 @@ data/
 chats.sqlite*
 tokens.sqlite*
 *.zip
-*.iml
-/.opencode

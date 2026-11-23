@@ -53,6 +53,24 @@ def voice_list() -> List[dict]:
             for v in SPEAKERS_RU]
 
 
+def detect_language(text: str, default: str = "ru") -> str:
+    """Грубая проверка: если латинских букв заметно больше кириллических — en, иначе default."""
+    cyr = sum(1 for ch in text if "а" <= ch.lower() <= "я" or ch in "ёЁ")
+    lat = sum(1 for ch in text if "a" <= ch.lower() <= "z")
+    return "en" if lat > 2 * cyr and lat >= 10 else default
+
+
+def make_tts(env: dict, data_dir: str):
+    """Движок озвучки по TTS_ENGINE: piper (по умолчанию, без torch) или silero (нужен torch)."""
+    engine = str(env.get("TTS_ENGINE") or "piper").strip().lower()
+    if engine == "piper":
+        from .tts_piper import PiperTTS
+        return PiperTTS(env, data_dir)
+    if engine == "silero":
+        return SileroTTS(env, data_dir)
+    raise ValueError(f"неизвестный TTS_ENGINE={engine!r}: используйте piper или silero")
+
+
 def normalize_speaker(value=None, default=None) -> str:
     """Проверить голос из запроса. Пустое значение = голос по умолчанию."""
     raw = str(value or "").strip().lower()
@@ -75,6 +93,8 @@ _HEADER_MARK = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
 _MARKS = re.compile(r"[*_~>|]+")
 _TOOL_NOTE = re.compile(r"\[инструменты:[^\]]*\]\s*\(\w+\)")
 _SOURCE_REF = re.compile(r"\[\d+\]")
+# Знаки, которые Silero не произнесёт как слова.
+_SYMBOLS = (("%", " процентов"), ("₽", " рублей"), ("&", " и "), ("№", "номер "))
 
 
 def clean_for_speech(text: str) -> str:
@@ -90,6 +110,8 @@ def clean_for_speech(text: str) -> str:
     t = _TOOL_NOTE.sub(" ", t)
     t = _SOURCE_REF.sub("", t)          # [1], [2] — номера источников
     t = _MARKS.sub(" ", t)
+    for sym, spoken in _SYMBOLS:
+        t = t.replace(sym, spoken)
     t = re.sub(r"\s+", " ", t).strip()
     return t[:MAX_TEXT]
 
@@ -162,6 +184,11 @@ class SileroTTS:
 
     # ----- состояние -----
 
+    engine = "silero"
+
+    def normalize_speaker(self, value=None) -> str:
+        return normalize_speaker(value, self.speaker)
+
     @property
     def ready(self) -> bool:
         return self._model is not None
@@ -173,7 +200,7 @@ class SileroTTS:
     def status(self) -> dict:
         model_exists = os.path.isfile(self.model_path)
         return {"enabled": self.enabled, "ready": self.ready, "speaker": self.speaker,
-                "device": self.device, "model_path": self.model_path,
+                "engine": self.engine, "device": self.device, "model_path": self.model_path,
                 "model_exists": model_exists, "autodownload": self.autodownload,
                 "voices": voice_list(),
                 # ready=false до первого синтеза (модель грузится лениво) — это не отказ сервера
@@ -231,8 +258,10 @@ class SileroTTS:
         model = self.load()
         with self._lock:
             try:
+                # put_accent — расстановка ударений, put_yo — восстановление «ё» (параметры apply_tts
+                # Silero). Без них русская речь обычно звучит хуже; на слух не проверено — см. docs/TTS.md.
                 audio = model.apply_tts(text=clean[:MAX_SEGMENT * 2], speaker=voice,
-                                        sample_rate=SAMPLE_RATE)
+                                        sample_rate=SAMPLE_RATE, put_accent=True, put_yo=True)
             except Exception as exc:              # noqa: BLE001 — ошибка синтеза → 503, а не 500
                 self.error = f"не удалось синтезировать речь: {exc}"
                 raise TTSError(self.error) from exc

@@ -61,7 +61,20 @@
 - `.env.example`: `PULSENET_MCP_HOSTS` (код его не читает) заменён на `MCP_ALLOWED_HOSTS`; добавлены `MCP_OWNER_ID`, `MCP_ADMIN_USERS`, `CODE_ACCESS_USERS`, `CODE_ROOTS`.
 - `run_server.bat`: сообщение об отсутствии `.venv` теперь указывает команды вместо несуществующего `setup_env.bat`.
 - `docs/CHAT_AGENTS.example.md` оставлен: правила для агента внутри приложения, а не для opencode.
-- `docs/AGENT_WORKSPACE.md`, `docs/TTS_SILERO.md` оставлены без изменений.
+- `docs/AGENT_WORKSPACE.md` оставлен без изменений. `docs/TTS_SILERO.md` заменён на `docs/TTS.md`, который описывает оба движка.
+
+## 2.4 Лишнее, найдено во второй проверке
+- Удалены 7 PNG-иконок в `web/static/icons/` — ни одна не используется.
+- Удалена функция `_health` в `server.py` — мёртвый код, `/health` обрабатывается выше по коду.
+- В ROADMAP исправлена ссылка на `eval/fixtures/queries.jsonl`: файла нет, теперь написано «создать».
+
+## 2.5 Озвучка: Piper вместо XTTS
+- XTTS-v2 удалён: в установке требовались torch, torchaudio, torchcodec и FFmpeg, и это не работало на машине пользователя.
+- Добавлен движок Piper (`pulsenet/tts_piper.py`): только `piper-tts` и onnxruntime, без torch и FFmpeg. Голоса — файлы `.onnx`, по одному на язык (`PIPER_VOICE_RU`, `PIPER_VOICE_EN`).
+- Движок по умолчанию: `TTS_ENGINE=piper`. Silero остаётся как `TTS_ENGINE=silero` и требует torch.
+- `detect_language` перенесён в `pulsenet/tts.py` и используется обоими движками.
+- Тесты: `tests/test_tts_piper.py` (заглушка голоса). Всего 313 тестов.
+- Не проверено в песочнице: загрузка голосов с huggingface.co и звук на реальной машине.
 
 ## 3. Решения, которые нужны от тебя (в коде не трогал)
 1. `migrate_memory.py` — одноразовый перенос `data/triplex` → `data_unified`. Если перенос сделан, удалить модуль и связанные тесты в `test_remote_memory.py`.
@@ -69,6 +82,7 @@
 3. `triplex/sleep.py` (M6) — нужен GPU, в рантайме не используется. Оставить, но вынести зависимости (torch, peft) в отдельный файл.
 4. Крупные файлы `app.py` (1541), `server.py` (1012), `static/app.js` (4238) — кандидаты на разбиение по доменам, не на удаление.
 5. `eval/` оставить вне рантайма.
+6. `web/sw.js` — заглушка: снимает регистрацию старого service worker. Удалить можно, когда все браузеры получили её; до тех пор оставить.
 
 ## 4. Следующие шаги
 1. Решить пункты 1–3 раздела 3.

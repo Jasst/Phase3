@@ -30,7 +30,7 @@ from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, ToolCallFilter, agent_limi
                          tool_result_block)
 from .tools import SEQUENTIAL_TOOLS, SUBAGENT_DENY, ChatTools, Outcome, catalog, instructions
 from .unified_mcp.store import IdentityStore
-from .tts import SileroTTS
+from .tts import make_tts
 from .workspace import Workspace
 
 CONTEXT_TURNS = 8
@@ -227,7 +227,7 @@ class App:
         self._index_recent: "deque[int]" = deque(maxlen=200)
         # Озвучка ответов (Silero): модель грузится лениво, при первом запросе озвучки
         # Модель лежит рядом с данными агента: data_unified/tts/v4_ru.pt (не в data/)
-        self.tts = SileroTTS(self.env, self.workspace.root)
+        self.tts = make_tts(self.env, self.workspace.root)
         self._mcp_cool_until = 0.0
         self._index_q: "queue.Queue[tuple]" = queue.Queue()
         self._worker = threading.Thread(target=self._index_loop, daemon=True, name="triplex-index")
