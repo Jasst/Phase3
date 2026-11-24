@@ -58,18 +58,64 @@ def build_encoder(env, data_dir: str, log_error: Callable[[str, BaseException], 
     return HashEncoder(512), server, ""
 
 
+def loaded_chat_model(env) -> str:
+    """Модель, реально загруженная в LM Studio (без эмбеддингов). '' — недоступно.
+
+    Используется и чатом, и MCP-сервером памяти: если пользователь сменил модель
+    в LM Studio, факты должны извлекаться ею, а не моделью из .env.
+    """
+    from .llm import http_json                  # локальный импорт: лёгкий helper без цикла
+
+    url = (env.get("LMSTUDIO_URL") or env.get("TRIPLEX_LLM_URL") or "").strip().rstrip("/")
+    for tail in ("/chat/completions", "/models"):
+        if url.endswith(tail):
+            url = url[:-len(tail)]
+    if not url:
+        return ""
+    base = url if url.endswith("/v1") else url + "/v1"
+    root = base[:-3] if base.endswith("/v1") else base
+    try:
+        data = http_json(root + "/api/v0/models", timeout=3)
+    except (OSError, ValueError):
+        return ""
+    found, embeddings = [], set()
+    for m in data.get("data", []):
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        if m.get("type") == "embeddings":
+            embeddings.add(m["id"])
+            continue
+        if m.get("state") not in ("loaded", "loading"):
+            continue
+        try:
+            used = float(m.get("last_used") or 0)
+        except (TypeError, ValueError):
+            used = 0.0
+        found.append((used, m["id"]))
+    ids = [mid for _, mid in sorted(found, reverse=True) if mid not in embeddings]
+    return ids[0] if ids else ""
+
+
 def build_extractor(env, model: str = "") -> Optional[Callable[[str], dict]]:
     """Экстрактор фактов через OpenAI-совместимый сервер (TRIPLEX_LLM_URL). Без адреса — None:
     документы сохраняются, факты не извлекаются.
 
-    model — явно выбранная модель (например, из веб-чата). Если пусто, берётся TRIPLEX_LLM_MODEL.
-    Это позволяет извлекать факты той же моделью, которой отвечает чат, не перезагружая эмбеддинги.
+    model — явно выбранная модель (например, из веб-чата). Если пусто, на каждый вызов
+    берётся реально загруженная в LM Studio модель, и только при её отсутствии —
+    TRIPLEX_LLM_MODEL из .env. Так факты идут моделью чата без второй загрузки.
     """
     if (env.get("TRIPLEX_EXTRACT") or "1") == "0":
         return None
     url = (env.get("TRIPLEX_LLM_URL") or "").strip()
     if not url:
         return None
-    model = (model or "").strip() or (env.get("TRIPLEX_LLM_MODEL") or "local").strip()
+    explicit = (model or "").strip()
     speaker = (env.get("TRIPLEX_USER_NAME") or "").strip() or None
-    return make_extractor(openai_chat_caller(url, model), speaker=speaker)
+    if explicit:
+        return make_extractor(openai_chat_caller(url, explicit), speaker=speaker)
+
+    def call(prompt: str) -> str:
+        chosen = loaded_chat_model(env) or (env.get("TRIPLEX_LLM_MODEL") or "local").strip()
+        return openai_chat_caller(url, chosen)(prompt)
+
+    return make_extractor(call, speaker=speaker)

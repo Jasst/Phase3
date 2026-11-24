@@ -14,7 +14,8 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from typing import Dict
+import uuid
+from typing import Dict, Optional
 
 LLAMACPP_PORT_DEFAULT = 8090
 LMSTUDIO_URL_DEFAULT = "http://localhost:1234/v1"
@@ -66,11 +67,14 @@ def _error_detail(exc):
     return body.strip()[:300] or str(exc.reason)
 
 
-_OVERFLOW_MARKERS = ("context", "too long", "exceed", "n_ctx", "token")
+# Только явные признаки переполнения. Раньше сюда попадало любое слово «token»,
+# из-за чего ошибка «tool arguments exceed token limit» скрывала откат с tools.
+_OVERFLOW_MARKERS = ("context length", "context window", "context is full", "too long",
+                     "n_ctx", "prompt is too large", "maximum context")
 
 
 def _is_overflow(detail: str) -> bool:
-    """400 из-за переполнения контекста — не признак того, что сервер не умеет function calling."""
+    """Ошибка размера запроса — не признак того, что сервер не умеет function calling."""
     low = (detail or "").lower()
     return any(marker in low for marker in _OVERFLOW_MARKERS)
 
@@ -118,15 +122,17 @@ class OpenAICompat:
                tools=None):
         """on_delta(kind, payload): 'token'/'reasoning' — текст, 'native_tool_calls' — список вызовов.
 
-        tools — схемы в формате OpenAI. Если сервер не поддерживает function calling (HTTP 400),
-        запрос повторяется без tools: чат continues на текстовом протоколе <tool_call>.
+        tools — схемы в формате OpenAI. Если сервер не поддерживает function calling
+        (400/404/422), запрос повторяется без tools: чат продолжает на <tool_call>.
         """
+        # Флаг отражает ТОЛЬКО последний запрос. Иначе после одного отката он оставался
+        # true навсегда и заставлял следующий ход зря переключаться на текстовый протокол.
+        self.last_native_unsupported = False
         body = {"model": model, "messages": messages, "stream": True,
                 "temperature": temperature, "max_tokens": max_tokens}
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
-            self.last_native_unsupported = False
         req = urllib.request.Request(self.base_url + "/chat/completions",
                                      data=json.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
@@ -134,19 +140,25 @@ class OpenAICompat:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as exc:        # сервер ответил, но с ошибкой
             detail = _error_detail(exc)
-            # 400 из-за переполнения контекста не означает «нет tools»: откат на текстовый
-            # протокол тогда только скрыл бы настоящую причину.
-            if exc.code == 400 and tools and not _is_overflow(detail):
-                # Флаг вместо on_delta: слушатель потока ждёт только токены и
-                # native_tool_calls, а лишнее событие ломало бы подписчиков.
-                self.last_native_unsupported = True
-                return self.stream(model, messages, on_delta, cancelled,
-                                   temperature, max_tokens, tools=None)
+            # Переполнение контекста — не «нет tools»: откат скрыл бы настоящую причину.
+            # Остальные коды означают, что сервер не принял unfamiliar поля запроса.
+            if exc.code in (400, 404, 422) and tools and not _is_overflow(detail):
+                # Флаг вместо on_delta: слушатель ждёт только токены и native_tool_calls.
+                try:
+                    return self.stream(model, messages, on_delta, cancelled,
+                                       temperature, max_tokens, tools=None)
+                finally:
+                    # Вложенный вызов сбросил флаг в начале stream() — восстанавливаем.
+                    self.last_native_unsupported = True
             raise BackendError(f"{self.name} ответил ошибкой {exc.code}: {detail}") from exc
         except OSError as exc:                       # сервер не отвечает вовсе
             raise BackendError(f"нет связи с LLM ({self.name}): {exc}") from exc
         splitter = ThinkSplitter()
-        calls: Dict[int, dict] = {}
+        # Ключ — index вызова: LM Studio шлёт id только в первом чанке, а затем
+        # только index. Группировка по id разбивала один вызов на два.
+        # Если index нет, падаем на id (допустимо для части серверов).
+        calls: Dict[str, dict] = {}
+        finish_reason = ""
         try:
             with resp:
                 for raw in resp:
@@ -163,6 +175,8 @@ class OpenAICompat:
                     except ValueError:
                         continue
                     choice = (ev.get("choices") or [{}])[0]
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice["finish_reason"])
                     delta = choice.get("delta") or {}
                     if delta.get("reasoning_content"):
                         on_delta("reasoning", delta["reasoning_content"])
@@ -170,17 +184,18 @@ class OpenAICompat:
                         for kind, text in splitter.feed(delta["content"]):
                             on_delta(kind, text)
                     for tc in (delta.get("tool_calls") or []):
-                        i = int(tc.get("index") or 0)
-                        cur = calls.setdefault(i, {"id": "", "name": "", "arguments": ""})
-                        if tc.get("id"):
-                            cur["id"] = tc["id"]
+                        tc_id = str(tc.get("id") or "")
+                        tc_index = tc.get("index")
+                        key = str(tc_index) if tc_index is not None else (tc_id or "0")
+                        cur = calls.setdefault(key, {"id": tc_id, "name": "", "arguments": ""})
+                        cur["id"] = cur["id"] or tc_id
                         fn = tc.get("function") or {}
                         name_part = fn.get("name") or ""
-                        # Одни серверы шлют имя целиком, другие кусками: полный повтор не склеиваем.
-                        if name_part and not cur["name"]:
-                            cur["name"] = name_part
-                        elif name_part and name_part != cur["name"]:
-                            cur["name"] += name_part
+                        # Имя приходит и целиком, и по частям, и нарастающими префиксами
+                        # ("web", "web_s", "web_search"). Полный повтор не склеиваем.
+                        if name_part and name_part != cur["name"]:
+                            cur["name"] = (name_part if name_part.startswith(cur["name"])
+                                           else cur["name"] + name_part)
                         if fn.get("arguments"):
                             cur["arguments"] += fn["arguments"]
         except (OSError, http.client.HTTPException) as exc:
@@ -194,14 +209,24 @@ class OpenAICompat:
         if calls:
             parsed = []
             for cur in calls.values():
+                error = ""
                 try:
                     args = json.loads(cur["arguments"] or "{}")
                 except ValueError:
-                    args = {}
+                    args, error = {}, "аргументы вызова оборваны или не являются JSON"
                 if not isinstance(args, dict):
-                    args = {}
-                parsed.append({"id": cur["id"] or "", "name": cur["name"], "arguments": args})
+                    args, error = {}, "аргументы вызова должны быть объектом"
+                item = {"id": cur["id"] or ("call_" + uuid.uuid4().hex[:8]),
+                        "name": cur["name"], "arguments": args}
+                if error:
+                    item["error"] = error      # не исполняем вызов с пустыми аргументами
+                parsed.append(item)
+            # Сначала вызовы, потом finish: слушатель, который финализирует ответ
+            # по finish, не должен потерять только что пришедшие tool_calls.
             on_delta("native_tool_calls", parsed)
+        if finish_reason:
+            # app.py отличает естественный конец от обрезки по max_tokens.
+            on_delta("finish", finish_reason)
 
 
 class LMStudioBackend(OpenAICompat):
@@ -217,17 +242,23 @@ class LMStudioBackend(OpenAICompat):
         self.default_model = env.get("LMSTUDIO_MODEL", "").strip()
         self.loaded = None
         self._loaded_at = 0.0
+        self._follow_model: Optional[str] = None   # кэш реально загруженной модели
+        self._follow_at = 0.0
 
     def _root_url(self):
         return self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
 
     def _loaded_ids(self):
-        """id моделей, реально находящихся в памяти (REST API LM Studio)."""
+        """id моделей, реально находящихся в памяти (REST API LM Studio).
+
+        Сортируем по last_used: если загружено несколько LLM, берём ту, которую
+        использовали последней. Эмбеддинги исключаются — это не модель чата.
+        """
         try:
             data = http_json(self._root_url() + "/api/v0/models", timeout=5)
         except (OSError, ValueError):
             return None
-        ids = []
+        found = []
         for m in data.get("data", []):
             if not isinstance(m, dict) or not m.get("id"):
                 continue
@@ -235,32 +266,46 @@ class LMStudioBackend(OpenAICompat):
                 continue
             if m.get("type") == "embeddings":
                 continue
-            ids.append(m["id"])
-        return ids
+            try:
+                used = float(m.get("last_used") or 0)
+            except (TypeError, ValueError):
+                used = 0.0
+            found.append((used, m["id"]))
+        found.sort(reverse=True)
+        return [mid for _, mid in found]
 
-    def refresh_loaded(self, force: bool = False):
-        """Диагностика: обновить `loaded` по фактическому состоянию LM Studio.
+    def loaded_model(self, force: bool = False) -> Optional[str]:
+        """Модель, которая реально загружена в LM Studio прямо сейчас.
 
-        НЕ используется для выбора модели: метод оставлен только для ручной
-        проверки состояния. Выбор идёт из аргумента пользователя, `active_model`
-        или статичного `default_model`; «первая загруженная» модель в чат не попадает.
+        Когда пользователь не выбрал модель явно, чат и экстрактор фактов должны
+        работать именно с ней: иначе LM Studio молча грузит модель из .env и
+        вытесняет ту, которая выбрана в интерфейсе LM Studio.
         """
         now = time.time()
-        if not force and self._loaded_at and now - self._loaded_at < 15:
-            return self.loaded
+        if not force and self._follow_at and now - self._follow_at < 10:
+            return self._follow_model
         ids = self._loaded_ids()
-        self._loaded_at = now
         if ids is None:      # старые версии: state есть только в /v1/models
             try:
                 data = http_json(self.base_url + "/models", timeout=5)
             except (OSError, ValueError):
-                return self.loaded
-            known = [m for m in data.get("data", [])
-                     if isinstance(m, dict) and m.get("id") and "state" in m]
-            if not known:
-                return self.loaded
-            ids = [m["id"] for m in known if m.get("state") == "loaded"]
-        self.loaded = ids[0] if ids else None
+                ids = []
+            else:
+                known = [m for m in data.get("data", [])
+                         if isinstance(m, dict) and m.get("id") and m.get("state") == "loaded"]
+                skip = self._embedding_ids()
+                ids = [m["id"] for m in known if m["id"] not in skip]
+        self._follow_at = now
+        self._follow_model = ids[0] if ids else None
+        return self._follow_model
+
+    def refresh_loaded(self, force: bool = False):
+        """Обновить `loaded` по фактическому состоянию LM Studio (для статуса)."""
+        now = time.time()
+        if not force and self._loaded_at and now - self._loaded_at < 15:
+            return self.loaded
+        self._loaded_at = now
+        self.loaded = self.loaded_model(force=force)
         return self.loaded
 
     def _embedding_ids(self):
@@ -277,8 +322,8 @@ class LMStudioBackend(OpenAICompat):
             data = http_json(self.base_url + "/models", timeout=5)
         except (OSError, ValueError) as exc:
             raise BackendError(f"LM Studio недоступен по адресу {self.base_url}: {exc}") from exc
-        # Список моделей — только чтение: раньше refresh_loaded() менял self.loaded
-        # на первую попавшуюся загруженную модель, и «выбор» прыгал без пользователя.
+        # Список — только чтение: сам список не должен менять выбор. Загруженную
+        # модель подхватывает loaded_model(), а не этот метод.
         skip = self._embedding_ids()
         return [m["id"] for m in data.get("data", []) if "id" in m and m["id"] not in skip]
 
@@ -291,12 +336,13 @@ class LMStudioBackend(OpenAICompat):
         return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
     def ensure(self, model, params=None):
-        # Только явный выбор пользователя или статичный default из .env.
-        # Раньше пустой аргумент подхватывал «первую загруженную в LM Studio» модель
-        # через refresh_loaded(): выбор менялся без участия пользователя.
-        target = (model or "").strip() or self.default_model
+        # Приоритет: явный выбор → модель, реально загруженная в LM Studio → .env.
+        # Раньше бралась только модель из .env, поэтому при смене модели в LM Studio
+        # сервер всё равно грузил gemma и facts извлекались именно ею.
+        target = (model or "").strip() or self.loaded_model() or self.default_model
         if not target:
-            raise BackendError("модель не выбрана: задайте LMSTUDIO_MODEL или выберите модель в интерфейсе")
+            raise BackendError("модель не выбрана: загрузите модель в LM Studio, "
+                               "задайте LMSTUDIO_MODEL или выберите модель в интерфейсе")
         # Модель из настроек другого бэкенда (например, путь .gguf из llama.cpp)
         # LM Studio не знает: без проверки запрос упал бы с непонятной ошибкой.
         if target not in self._known_ids():

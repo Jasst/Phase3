@@ -37,28 +37,41 @@ def _env_int(env: dict, key: str, default: int, lo: int = 1, hi: int = 100) -> i
         return default
 
 
+def _env_int0(env: dict, key: str, default: int, hi: int = 100000) -> int:
+    """Как _env_int, но 0 — осознанный выбор «без лимита», а не опечатка."""
+    try:
+        value = int(str(env.get(key, "")).strip() or default)
+    except ValueError:
+        return default
+    return max(0, min(hi, value))
+
+
 def agent_limits(env: Optional[dict] = None) -> dict:
-    """Лимиты агентного цикла. env=None — текущее окружение (значения по умолчанию 6/8/12)."""
+    """Лимиты агентного цикла. 0 = без лимита; env=None — текущее окружение."""
     env = os.environ if env is None else env
-    rounds = _env_int(env, "AGENT_MAX_ROUNDS", 6, 1, 7)
+    rounds = _env_int0(env, "AGENT_MAX_ROUNDS", 6, 7)
     return {
         "max_rounds": rounds,
-        "hard_cap": _env_int(env, "AGENT_HARD_CAP", max(rounds + 2, 8), rounds, 12),
-        "max_calls": _env_int(env, "AGENT_MAX_CALLS", 12, 1, 40),
+        # Оставлен для совместимости со старыми .env; в цикле не используется.
+        "hard_cap": _env_int(env, "AGENT_HARD_CAP", max(rounds + 2, 8), 1, 12),
+        "max_calls": _env_int0(env, "AGENT_MAX_CALLS", 12, 40),
         "reflection_budget": _env_int(env, "AGENT_REFLECTION_BUDGET", 2, 0, 10),
+        # Сколько раз просить модель договорить после finish_reason=length. 0 — без лимита.
+        "max_continuations": _env_int0(env, "AGENT_MAX_CONTINUATIONS", 2, 1000),
         "result_chars": _env_int(env, "TOOL_RESULT_CONTEXT_CHARS", 1200, 200, 20000),
         # Отдельный лимит генерации на шаг агента: 1024 не хватало на JSON <tool_call>
         "agent_max_tokens": _env_int(env, "AGENT_MAX_TOKENS", 2048, 512, 8192),
         # Потолки системного промпта и всего запроса, чтобы локальная модель не обрезалась
         "system_max": _env_int(env, "AGENT_SYSTEM_MAX_CHARS", 6000, 1000, 30000),
         "context_max": _env_int(env, "AGENT_CONTEXT_MAX_CHARS", 20000, 4000, 60000),
-        "native_max": _env_int(env, "TOOL_NATIVE_MAX", 10, 3, 30),
+        # 0 — отправлять все доступные схемы, а не только первые N.
+        "native_max": _env_int0(env, "TOOL_NATIVE_MAX", 10, 30),
         "image_timeout": _env_int(env, "MCP_TOOL_TIMEOUT_IMAGE", 300, 30, 900),
         # параллельные вызовы в одном шаге: сколько принимаем и сколько выполняем одновременно
-        "calls_per_step": _env_int(env, "AGENT_CALLS_PER_STEP", 4, 1, 8),
+        "calls_per_step": _env_int0(env, "AGENT_CALLS_PER_STEP", 4, 8) or 1000000,
         "parallel": _env_int(env, "AGENT_PARALLEL", 4, 1, 8),
-        # субагент: раундов на задачу и одновременных LLM-запросов субагентов
-        "sub_rounds": _env_int(env, "SUBAGENT_MAX_ROUNDS", 3, 1, 6),
+        # субагент: 0 раундов = работает, пока не вернёт текст
+        "sub_rounds": _env_int0(env, "SUBAGENT_MAX_ROUNDS", 3, 6),
         "llm_parallel": _env_int(env, "AGENT_LLM_PARALLEL", 1, 1, 4),
         # пауза после сбоя сервера памяти: ход не ждёт его каждый раз (сек)
         "mcp_cooldown": _env_int(env, "MCP_COOLDOWN_SECONDS", 45, 0, 600),
@@ -451,6 +464,20 @@ class ToolCallFilter:
                 break
         return "".join(out)
 
+    def reset(self) -> None:
+        """Очистить состояние перед повторной отправкой того же запроса модели.
+
+        При обрыве потока в буфере может остаться начало тега или вызова; без сброса
+        повторный ответ склеивается с этим мусором и выдаёт испорченный текст.
+        """
+        self.buf = ""
+        self.inside = False
+        self.native = False
+        self.open_name = ""
+        self._open_tag = ""
+        self.calls_raw.clear()
+        self.fake_results = 0
+
     def finish(self) -> str:
         rest, self.buf = self.buf, ""
         if self.inside:
@@ -722,6 +749,12 @@ def parse_calls(raw_bodies: List[str], known: Optional[Iterable[str]] = None) ->
             args = _call_args(obj.get(key) if key else None)
         if args is None:
             calls.append({"name": name, "arguments": {}, "error": "arguments должен быть объектом"})
+            continue
+        # Нативный tool_call с оборванными аргументами приходит с полем error:
+        # такой вызов не должен исполниться с пустыми аргументами.
+        passed = obj.get("error") if isinstance(obj, dict) else None
+        if isinstance(passed, str) and passed.strip():
+            calls.append({"name": name, "arguments": args, "error": passed.strip()[:300]})
             continue
         calls.append({"name": name, "arguments": args})
     return calls

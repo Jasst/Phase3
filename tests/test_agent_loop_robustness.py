@@ -30,6 +30,9 @@ class Scripted:
         self.seen.append([dict(m) for m in messages])
         step = self.script.pop(0) if self.script else ["готово."]
         for piece in step:
+            if isinstance(piece, tuple) and piece and piece[0] == "finish":
+                on_delta("finish", piece[1])       # маркер обрезки max_tokens
+                continue
             if isinstance(piece, BaseException):
                 raise piece
             on_delta("token", piece)
@@ -364,3 +367,43 @@ def test_repeated_bad_calls_stop_with_own_reason(tmp_path):
     stops = [t.get("stop") for t in trace if t.get("stop")]
     assert stops and stops[-1] == "bad_calls"
     assert "без прогресса" not in answer
+
+
+# ---------- обрывы, continuation и globals stop ----------
+
+def test_global_stop_does_not_cancel_future_turns(tmp_path):
+    """После нажатия «Стоп» следующие сообщения должны снова доходить до модели."""
+    app = _app(tmp_path, [["готово."]])
+    app.stop()
+    assert app.stop_flag is True
+    answer, trace = _run(app)
+    assert answer == "готово."
+    assert trace[-1]["stop"] == "model_done"
+
+
+def test_length_truncation_continues_answer(tmp_path):
+    """finish_reason=length: модель должна договорить, а не выдать обрезок как финал."""
+    app = _app(tmp_path, [["Начало ответа", ("finish", "length")],
+                          [" — и продолжение."]])
+    steps = []
+
+    def on_delta(kind, payload):
+        if kind == "step":
+            steps.append(payload)
+
+    answer = app.chat("вопрос", "c1", on_delta)
+    assert "Начало ответа" in answer and "продолжение" in answer
+    assert any(p.get("label") == "Продолжение ответа" for p in steps)
+
+
+def test_context_overflow_retries_with_shorter_request(tmp_path):
+    app = _app(tmp_path, [[BackendError("400: context length exceeded")], ["итог."]])
+    app._append_history("c1", "user", "x" * 3000)
+    app._append_history("c1", "assistant", "y" * 3000)
+    answer, trace = _run(app)
+    assert answer == "итог."
+    assert len(app.backend.seen) == 2
+    before = sum(len(str(m["content"])) for m in app.backend.seen[0])
+    after = sum(len(str(m["content"])) for m in app.backend.seen[1])
+    assert after < before
+    assert trace[-1]["stop"] == "model_done"

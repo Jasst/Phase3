@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Выбор модели детерминирован: пользователь / явный запрос / .env, но не «что загружено»."""
+"""Выбор модели: явный выбор → реально загруженная в LM Studio → .env."""
 import pytest
 
 import pulsenet.llm as llm
+import pulsenet.memory_service as memory_service
 from pulsenet.app import App
 
 
@@ -14,16 +15,22 @@ class FakeBackend:
     def __init__(self):
         self.ensured = []
         self.unsupported_refresh = False
+        self._loaded_for_test = None
+
+    def loaded_model(self, force=False):
+        return self._loaded_for_test
 
     def ensure(self, model, params=None):
         self.ensured.append(model)
-        self.loaded = model or "fake"
+        target = model or self.loaded_model() or "fake"
+        self.loaded = target
+        self._loaded_for_test = target     # LM Studio грузит модель самим запросом
         return self.loaded
 
     def refresh_loaded(self):
         if self.unsupported_refresh:
             raise AssertionError(" refresh_loaded не должен вызываться при выборе модели")
-        return "other-model-in-lmstudio"
+        return self.loaded_model()
 
     def list_models(self):
         return ["configured/model", "other-model-in-lmstudio"]
@@ -37,7 +44,15 @@ def _app(tmp_path, model="configured/model"):
     return app
 
 
-def test_default_is_configured_not_loaded(tmp_path):
+def test_default_is_loaded_model_when_available(tmp_path):
+    app = _app(tmp_path)
+    app.backend._loaded_for_test = "other-model-in-lmstudio"
+    assert app.default_rel() == "other-model-in-lmstudio"
+    assert app.resolve_model() == "other-model-in-lmstudio"
+    assert app.extraction_model() == "other-model-in-lmstudio"
+
+
+def test_default_falls_back_to_configured(tmp_path):
     app = _app(tmp_path)
     app.backend.unsupported_refresh = True
     assert app.default_rel() == "configured/model"
@@ -66,14 +81,14 @@ def test_memory_operations_do_not_change_chosen_model(tmp_path):
     assert app.backend.ensured == []                 # запись не загружает модель
 
 
-def test_status_does_not_probe_loaded_model(tmp_path):
+def test_status_shows_loaded_and_fact_model(tmp_path):
     app = _app(tmp_path)
-    app.active_model = "chat/model"
+    app.backend._loaded_for_test = "chat/model"
     app.backend.loaded = "chat/model"
-    app.backend.unsupported_refresh = True
     app.memory.stats = lambda: {}
     status = app.status()
     assert status["model"] == "chat/model"
+    assert status["loaded_model"] == "chat/model"
     assert status["fact_model"] == "chat/model"
 
 
@@ -96,7 +111,7 @@ def test_lmstudio_list_models_is_read_only(monkeypatch):
     assert backend.loaded == "configured/model"       # список не меняет выбор
 
 
-def test_chat_uses_explicit_model_and_keeps_it(tmp_path):
+def test_chat_uses_explicit_model_and_facts_follow_it(tmp_path):
     app = _app(tmp_path)
 
     def script(model, messages, on_delta, cancelled, **kwargs):
@@ -108,29 +123,32 @@ def test_chat_uses_explicit_model_and_keeps_it(tmp_path):
     app.chat("первый", "c1", lambda kind, payload: None, model="user/choice")
     assert app.seen_models[-1] == "user/choice"
     assert app.active_model == "user/choice"
+    assert app.extraction_model() == "user/choice"    # LM Studio теперь держит user/choice
 
-    # Второй ход без model использует уже выбранную модель, а не «первую загруженную».
+    # Второй ход без model тоже идёт загруженной моделью, а не «первой из .env».
     app.chat("второй", "c1", lambda kind, payload: None)
     assert app.seen_models[-1] == "user/choice"
-    assert app.active_model == "user/choice"
-    assert app.default_rel() == "configured/model"
+    assert app.extraction_model() == "user/choice"
 
 
-def test_lmstudio_ensure_does_not_pick_loaded_model_without_choice(monkeypatch):
+def test_lmstudio_ensure_picks_loaded_model_without_choice(monkeypatch):
     backend = llm.LMStudioBackend({"LMSTUDIO_URL": "http://fake/v1", "LMSTUDIO_MODEL": ""})
-    backend.loaded = None
+    monkeypatch.setattr(backend, "_loaded_ids", lambda: ["other-model-in-lmstudio"])
+    monkeypatch.setattr(backend, "_known_ids", lambda: ["other-model-in-lmstudio", "user/choice"])
+    assert backend.ensure("") == "other-model-in-lmstudio"
+    assert backend.loaded == "other-model-in-lmstudio"
 
-    def forbidden_refresh(*_a, **_kw):
-        raise AssertionError("ensure не должен опрашивать LM Studio и брать первую загруженную модель")
+    # Явный выбор всё равно имеет приоритет.
+    assert backend.ensure("user/choice") == "user/choice"
+    assert backend.loaded == "user/choice"
 
-    monkeypatch.setattr(backend, "refresh_loaded", forbidden_refresh)
-    monkeypatch.setattr(backend, "_known_ids", lambda: ["other-model-in-lmstudio"])
+
+def test_lmstudio_ensure_fails_when_nothing_loaded_and_no_default(monkeypatch):
+    backend = llm.LMStudioBackend({"LMSTUDIO_URL": "http://fake/v1", "LMSTUDIO_MODEL": ""})
+    monkeypatch.setattr(backend, "_loaded_ids", lambda: [])
     with pytest.raises(llm.BackendError, match="модель не выбрана"):
         backend.ensure("")
     assert backend.loaded is None
-
-    assert backend.ensure("other-model-in-lmstudio") == "other-model-in-lmstudio"
-    assert backend.loaded == "other-model-in-lmstudio"
 
 
 def test_llamacpp_external_does_not_invent_model(monkeypatch):
@@ -147,9 +165,25 @@ def test_llamacpp_external_does_not_invent_model(monkeypatch):
     assert backend.external is True
 
 
-def test_status_falls_back_to_configured_not_backend_loaded(tmp_path):
+def test_status_uses_loaded_model_not_configured(tmp_path):
     app = _app(tmp_path)
+    app.backend._loaded_for_test = "other-model-in-lmstudio"
     app.backend.loaded = "other-model-in-lmstudio"
     app.memory.stats = lambda: {}
-    assert app.status()["model"] == "configured/model"
-    assert app.status()["fact_model"] == "configured/model"
+    assert app.status()["model"] == "other-model-in-lmstudio"
+    assert app.status()["fact_model"] == "other-model-in-lmstudio"
+
+
+def test_loaded_chat_model_skips_embeddings_and_uses_last_used(monkeypatch):
+    def fake_http_json(url, timeout=10):
+        if url.endswith("/api/v0/models"):
+            return {"data": [
+                {"id": "emb", "type": "embeddings", "state": "loaded", "last_used": 99},
+                {"id": "old", "type": "llm", "state": "loaded", "last_used": 1},
+                {"id": "new", "type": "llm", "state": "loaded", "last_used": 2},
+            ]}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(llm, "http_json", fake_http_json)
+    env = {"LMSTUDIO_URL": "http://localhost:1234/v1", "TRIPLEX_LLM_MODEL": "env-model"}
+    assert memory_service.loaded_chat_model(env) == "new"

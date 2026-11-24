@@ -180,7 +180,6 @@
     }
     return out;
   }
-  const MAX_TRACE_STEPS = 40;
   function mergeStepLists(a, b) {
     const listA = Array.isArray(a) ? a : [];
     const listB = Array.isArray(b) ? b : [];
@@ -192,7 +191,7 @@
       if (i < 0) out.push({ ...s });
       else out[i] = { ...out[i], ...s };
     }
-    return out.length > MAX_TRACE_STEPS ? out.slice(-MAX_TRACE_STEPS) : out;
+    return out;   // трасса безлимитная: сервер хранит все шаги хода
   }
   // Копии одного ответа могут прийти с сервера, из черновика другой вкладки и из
   // localStorage. Трасса и шаги не должны теряться, если «короткая» копия побеждает
@@ -645,6 +644,8 @@
           bot.pending = false;
           bot.gen = captureMetrics();
           bot.indexPending = Number(ev.done.index_pending) || 0;
+          if (ev.done.status === 'stopped') bot.note = 'Остановлено';
+          else if (bot.note && bot.note.indexOf('Поток прерван') === 0) bot.note = '';
         feedTts(bot, true);
           finished = true;
         }
@@ -1273,6 +1274,7 @@
   const STOP_LABEL = {
     model_done: 'ответ готов', round_limit: 'лимит шагов', call_limit: 'лимит вызовов',
     failures: 'ошибки инструментов', no_progress: 'нет прогресса', cancelled: 'остановлено',
+    llm_error: 'модель недоступна/обрыв', bad_calls: 'не удалось разобрать вызовы',
   };
   const STEP_PHASE_LABEL = { start: 'начало', end: 'итоги', final: 'финал', note: 'заметка' };
   const STEP_STATE_LABEL = { running: 'выполняется', done: 'готово', error: 'ошибка', warning: 'внимание' };
@@ -1328,8 +1330,10 @@
   function stepBudgetText(b) {
     if (!b || typeof b !== 'object') return '';
     const parts = [];
-    if (b.round || b.max_rounds) parts.push('шаг ' + (b.round || 0) + '/' + (b.max_rounds || '—'));
-    if (b.calls || b.max_calls) parts.push('вызовов ' + (b.calls || 0) + '/' + (b.max_calls || '—'));
+    if (b.unlimited || b.max_rounds === 0) parts.push('шаг ' + (b.round || 0) + '/∞');
+    else if (b.round || b.max_rounds) parts.push('шаг ' + (b.round || 0) + '/' + (b.max_rounds || '—'));
+    if (b.unlimited || b.max_calls === 0) parts.push('вызовов ' + (b.calls || 0) + '/∞');
+    else if (b.calls || b.max_calls) parts.push('вызовов ' + (b.calls || 0) + '/' + (b.max_calls || '—'));
     return parts.join(' · ');
   }
   function renderStepCall(c) {
@@ -1452,7 +1456,6 @@
     const cur = bot.steps.find((x) => x && x.id === s.id);
     if (cur) Object.assign(cur, s);
     else bot.steps.push({ ...s });
-    if (bot.steps.length > MAX_TRACE_STEPS) bot.steps.splice(0, bot.steps.length - MAX_TRACE_STEPS);
   }
   function addSources(bot, list) {
     if (!Array.isArray(bot.sources)) bot.sources = [];
@@ -1593,6 +1596,8 @@
           bot.pending = false;
           bot.gen = captureMetrics();
           bot.indexPending = Number(ev.done.index_pending) || 0;
+          if (ev.done.status === 'stopped') bot.note = 'Остановлено';
+          else if (bot.note && bot.note.indexOf('Поток прерван') === 0) bot.note = '';
         feedTts(bot, true);
           finished = true;
         }
@@ -1601,7 +1606,10 @@
       if (err && err.name === 'AbortError') {
         if (!bot.error) bot.note = stopRequested ? 'Остановлено' : 'Ответ прерван';
       } else {
-        bot.error = err && err.message ? err.message : String(err);
+        // Обрыв соединения не значит обрыв генерации: задача продолжается на сервере,
+        // а финальный текст придёт через /api/chats. Не портим им уже показанный ответ.
+        bot.note = 'Поток прерван — жду ответ с сервера';
+        toast('Связь прервалась, проверяю ответ на сервере…');
       }
     } finally {
       stopMetrics();
@@ -1638,8 +1646,12 @@
     if (!busy) return;
     stopRequested = true;
     if (abortCtl) abortCtl.abort();
+    // Важно: останавливаем конкретный чат. Без chat_id сервер выставит глобальный
+    // флаг, и после первой же остановки модель перестанет отвечать во всех чатах.
+    const s = currentSession();
+    const body = s ? JSON.stringify({ chat_id: chatKey(s) }) : '{}';
     fetch('/api/chat/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin' }).catch(() => {});
+      credentials: 'same-origin', body }).catch(() => {});
     toast('Останавливаю ответ…');
   }
 
@@ -2305,7 +2317,7 @@
       }
       select.value = settings.model || '';
       setHint(models.length
-        ? 'Модель применяется к следующему ответу. Эмбеддинги в список не входят.'
+        ? '«По умолчанию» — модель, загруженная в LM Studio сейчас; факты идут той же моделью. Эмбеддинги в список не входят.'
         : 'Моделей нет: загрузите модель в LM Studio или проверьте LLM_BACKEND.');
     } catch (err) {
       select.innerHTML = '<option value="">список недоступен</option>';
@@ -2343,6 +2355,12 @@
       (online ? '' : ' — недоступна')));
     mem2.appendChild(el('span', '', online ? 'все агенты пишут в одно хранилище' : 'чат работает без памяти, сообщения ждут восстановления'));
     els.statusGrid.appendChild(mem2);
+    if (s.loaded_model) {
+      const lm = el('div', 'stat wide');
+      lm.appendChild(el('b', '', s.loaded_model));
+      lm.appendChild(el('span', '', 'загружена в LM Studio сейчас'));
+      els.statusGrid.appendChild(lm);
+    }
     if (s.fact_model) {
       const fm = el('div', 'stat wide');
       fm.appendChild(el('b', '', s.fact_model));
@@ -2382,7 +2400,8 @@
       els.statusDot.className = 'status ok';
       els.modelChip.classList.remove('bad');
       els.modelName.textContent = s.model || s.backend || 'модель';
-      els.modelChip.title = 'Бэкенд: ' + (s.backend || '—') + (s.model ? ' · модель: ' + s.model : '');
+      els.modelChip.title = 'Бэкенд: ' + (s.backend || '—') + (s.model ? ' · модель: ' + s.model : '') +
+        (s.loaded_model ? ' · загружена в LM Studio: ' + s.loaded_model : '');
       els.chatSub.textContent = (s.backend || 'backend') + (s.model ? ' · ' + s.model : '') +
         ' · фактов: ' + (m.facts_active ?? 0);
       els.sbStat.textContent = 'фактов: ' + (m.facts_active ?? 0) + ' · документов: ' + (m.docs ?? 0) +

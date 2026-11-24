@@ -61,6 +61,15 @@ def test_agent_limits_defaults_and_overrides():
     assert lim["max_calls"] == 3 and lim["result_chars"] == 200
 
 
+def test_agent_limits_zero_means_unlimited():
+    lim = agent_limits({"AGENT_MAX_ROUNDS": "0", "AGENT_MAX_CALLS": "0",
+                        "SUBAGENT_MAX_ROUNDS": "0", "TOOL_NATIVE_MAX": "0",
+                        "AGENT_CALLS_PER_STEP": "0"})
+    assert lim["max_rounds"] == 0 and lim["max_calls"] == 0
+    assert lim["sub_rounds"] == 0 and lim["native_max"] == 0
+    assert lim["calls_per_step"] == 1000000
+
+
 def test_tool_result_block_custom_limit():
     block = tool_result_block("image_generate", "x" * 5000, 80)
     assert "обрезано" in block and len(block) < 150
@@ -348,6 +357,73 @@ def test_llm_parses_streamed_tool_calls(monkeypatch):
     native = [p for k, p in calls if k == "native_tool_calls"]
     assert len(native) == 1 and native[0][0]["name"] == "image_generate"
     assert native[0][0]["arguments"] == {"prompt": "a cat"}
+
+
+def test_llm_merges_lmstudio_style_tool_call_chunks(monkeypatch):
+    """LM Studio шлёт id только в первом чанке, имя — нарастающим префиксом."""
+    lines = [
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+        b'"function":{"name":"web","arguments":""}}]}}]}\n\n',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        b'"function":{"name":"web_search","arguments":"{\\"queries\\":["}}]}}]}\n\n',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        b'"function":{"arguments":"\\"python\\"]}"}}]}}]}\n\n',
+        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter(lines)
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", lambda req, timeout: Resp())
+    calls = []
+    backend = llm.OpenAICompat()
+    backend.base_url = "http://fake/v1"
+    backend.stream("m", [], lambda kind, payload: calls.append((kind, payload)), lambda: False,
+                   tools=[{"type": "function", "function": {"name": "web_search"}}])
+    kinds = [k for k, _ in calls]
+    assert kinds.index("native_tool_calls") < kinds.index("finish")
+    native = [p for k, p in calls if k == "native_tool_calls"]
+    assert len(native) == 1
+    assert native[0][0] == {"id": "c1", "name": "web_search",
+                            "arguments": {"queries": ["python"]}}
+
+
+def test_llm_native_unsupported_flag_is_per_request(monkeypatch):
+    bodies = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter([b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+                         b"data: [DONE]\n\n"])
+
+    def fake_urlopen(req, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "tools" in body and len(bodies) == 1:
+            raise urllib.error.HTTPError(req.full_url, 422, "unsupported tools", {}, None)
+        return Resp()
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    backend = llm.OpenAICompat()
+    backend.base_url = "http://fake/v1"
+    backend.stream("m", [], lambda kind, payload: None, lambda: False, tools=[{"type": "function"}])
+    assert backend.last_native_unsupported is True
+    backend.stream("m", [], lambda kind, payload: None, lambda: False)
+    assert backend.last_native_unsupported is False
 
 
 # ---------- SSE ----------

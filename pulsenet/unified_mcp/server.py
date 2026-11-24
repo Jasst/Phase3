@@ -156,26 +156,29 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
     def triplex_ingest(text: str = Field(..., description="Текст для сохранения (сообщение, решение, заметка)"),
                        session_id: str = Field("", description="Необязательный id сессии"),
                        role: str = Field("user", description="user | assistant | system"),
-                       model: str = Field("", description="Модель экстракции; пусто — TRIPLEX_LLM_MODEL. "
-                                                          "Веб-чат передаёт модель текущего ответа"),
+                       model: str = Field("", description="Модель экстракции; пусто — загруженная в LM Studio "
+                                                          "(иначе TRIPLEX_LLM_MODEL). Чат передаёт свою модель"),
                        recorded_at: str = Field("", description="Стабильная ISO-метка для идемпотентной "
                                                                 "загрузки чата; пусто — время сервера"),
                        ctx: Context = None) -> Dict[str, Any]:
         """Сохранить документ в память и извлечь из него факты. Документ сохраняется даже при сбое
         извлечения. Возвращает doc_id: его нужно указать как source при triplex_assert.
 
-        model — модель, которой извлекаются факты: чат передаёт свою текущую модель, чтобы факты
-        записывались той же моделью, а не фиксированной из .env."""
+        model — модель, которой извлекаются факты: чат передаёт свою текущую модель; пусто —
+        модель, реально загруженная в LM Studio, и только при её отсутствии .env."""
         uid, mem, e = mem_of(ctx)
         if e:
             return e
         try:
+            # Пустой model теперь не «модель из .env»: build_extractor берёт загруженную
+            # в LM Studio модель на момент вызова. TRIPLEX_EXTRACT=0 сохраняет старое
+            # поведение: без явной модели — no_extractor, с явной — документ без фактов.
             extractor = None
-            if (model or "").strip():
+            if (cfg.env.get("TRIPLEX_EXTRACT") or "1") != "0":
                 from ..memory_service import build_extractor
                 extractor = build_extractor(cfg.env, model=model)
-                if extractor is None:              # TRIPLEX_EXTRACT=0 — экстракция отключена
-                    extractor = _NO_EXTRACT
+            elif (model or "").strip():
+                extractor = _NO_EXTRACT
             return mem.ingest(text, session_id=session_id, role=role, agent=uid,
                               recorded_at=(recorded_at or None), extractor=extractor)
         except ValueError as exc:

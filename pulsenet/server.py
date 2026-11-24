@@ -110,6 +110,8 @@ class ChatJob:
                 self.reasoning_events.append({"text": payload, "at": len(self.text)})
             elif kind in ("tool", "sources", "image", "todo", "trace", "step"):
                 self.events.append({"kind": kind, "data": payload, "at": len(self.text)})
+            elif kind == "finish":
+                return                    # служебный маркер length/stop, не текст ответа
             else:
                 self.text += payload
 
@@ -407,16 +409,19 @@ class Handler(BaseHTTPRequestHandler):
         text_pos = 0
         reason_pos = 0
         event_pos = 0
+        last_ping = time.monotonic()
         try:
             while True:
                 snap = job.snapshot()
                 text = snap["text"]
+                emitted = False
 
                 def emit_until(pos):
-                    nonlocal text_pos
+                    nonlocal text_pos, emitted
                     if pos > text_pos:
                         self.sse({"token": text[text_pos:pos]})
                         text_pos = pos
+                        emitted = True
 
                 # Рассуждения и события (step, tool, …) имеют позицию в тексте.
                 # Объединяем их в один timeline: <think> уходит ДО токенов, которые
@@ -431,11 +436,22 @@ class Handler(BaseHTTPRequestHandler):
                         ev = events[event_pos]
                         self.sse({ev["kind"]: ev["data"]})
                         event_pos += 1
+                        emitted = True
                     else:
                         emit_until(rs_at)
                         self.sse({"reasoning": reasons[reason_pos]["text"]})
                         reason_pos += 1
+                        emitted = True
                 emit_until(len(text))
+                now = time.monotonic()
+                if emitted:
+                    last_ping = now
+                elif now - last_ping >= 10:
+                    # Долгий инструмент (image_generate до 300 с) не шлёт событий.
+                    # Комментарий держит SSE-соединение живым и не мешает клиентам.
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_ping = now
                 if snap["status"] != "running":
                     if snap["error"]:
                         self.sse({"error": snap["error"]})

@@ -214,11 +214,16 @@ def test_build_extractor_honors_explicit_model(monkeypatch):
 
     seen = []
     monkeypatch.setattr(ms, "openai_chat_caller",
-                        lambda url, model: seen.append((url, model)) or (lambda prompt: "{}"))
+                        lambda url, model: seen.append((url, model)) or
+                        (lambda prompt: '{"facts": [], "entities": []}'))
+    monkeypatch.setattr(ms, "loaded_chat_model", lambda env: "")   # LM Studio недоступен
     env = {"TRIPLEX_LLM_URL": "http://llm/v1", "TRIPLEX_LLM_MODEL": "env-model"}
-    assert ms.build_extractor(env) is not None
+    extractor = ms.build_extractor(env)
+    assert extractor is not None
+    extractor("текст")                                   # модель берётся на момент вызова
     assert seen[-1][1] == "env-model"
-    assert ms.build_extractor(env, model="chat/model") is not None
+    extractor = ms.build_extractor(env, model="chat/model")
+    extractor("текст")
     assert seen[-1][1] == "chat/model"                    # модель чата перекрывает .env
 
 

@@ -53,7 +53,10 @@ ASSISTANT_PERSONA = (
     "включая image_generate. Если пользователь просит изображение, картинку, рисунок или иллюстрацию — "
     "вызови image_generate и отправь результат. Не говори, что ты «текстовая нейросеть», не проси "
     "вставить промпт в Midjourney/DALL·E и не советуй другие сервисы: ты можешь создать изображение сам(а). "
-    "Для поиска фактов и свежих данных используй доступные инструменты, а не догадки."
+    "Для поиска фактов и свежих данных используй доступные инструменты, а не догадки. "
+    "Работай до конца задачи: после каждого вызова инструмента используй его результат и делай следующий шаг. "
+    "Не останавливайся на первом же ответе инструмента, если вопрос ещё не решён. "
+    "Итоговый ответ давай только текстом, когда всё нужное собрано и проверено."
 )
 
 
@@ -70,7 +73,10 @@ WORKFLOW_HINT = (
     "4) картинку из image_generate можно вставить в заметку: image_url=\"last\"; "
     "5) субагент (subagent) — для самостоятельной подзадачи, которую можно описать одной фразой "
     "(поиск в памяти, сбор фактов, картинка). В task — что вернуть, в context — нужный кусок вопроса. "
-    "Не делегируй то, что сделаешь одним вызовом сам. Несколько subagent в одном шаге идут параллельно."
+    "Не делегируй то, что сделаешь одним вызовом сам. Несколько subagent в одном шаге идут параллельно. "
+    "6) независимые вызовы (поиск, чтение, субагенты) отправляй одним шагом — они выполняются "
+    "параллельно; повторяй вызов только если изменил аргументы или сменил инструмент. "
+    "7) image_generate вызывай только когда пользователь просит изображение."
 )
 
 
@@ -184,6 +190,10 @@ class App:
         self.history_lock = threading.Lock()
         self.errors: deque = deque(maxlen=ERROR_LOG_SIZE)
         self.stop_flag = False
+        # Счётчик остановок: stop_flag остаётся true для совместимости с /api/status и
+        # тестами, но сам по себе не отменяет будущие ходы. Ход запоминает epoch на старте
+        # и отменяется только если за время его работы последовала новая остановка.
+        self.stop_epoch = 0
         self.memory_enabled = self.env.get("TRIPLEX_MEMORY", "1") != "0"
         self.embed_server = None
         self.embed_model = ""
@@ -244,21 +254,33 @@ class App:
 
     # ---------- память ----------
 
-    def default_rel(self) -> str:
-        """Статичный default из настроек — НЕ «первая загруженная модель» в LM Studio.
+    def _loaded_rel(self) -> str:
+        """Модель, реально загруженная в LM Studio. Для других бэкендов — пусто."""
+        probe = getattr(self.backend, "loaded_model", None)
+        if probe is None:
+            return ""
+        try:
+            return (probe() or "").strip()
+        except Exception as exc:                   # noqa: BLE001 — LM Studio может быть недоступен
+            self.log_error("загруженная модель", exc)
+            return ""
 
-        Опрос LM Studio здесь запрещён: другой процесс/агент может загрузить свою модель,
-        и выбор в чате начал бы «прыгать» без участия пользователя. Модель меняется только
-        явным выбором в интерфейсе (поле model) или значением в .env.
+    def default_rel(self) -> str:
+        """Модель по умолчанию: загруженная в LM Studio, иначе значение из .env.
+
+        Раньше бралась только модель из .env, из-за чего при смене модели в LM Studio
+        чат и экстрактор фактов всё равно грузили google/gemma-4-26b-a4b-qat.
         """
         if self.backend.name == "llamacpp":
             return self.env.get("LLAMACPP_DEFAULT_MODEL", "").strip()
-        return self.env.get("LMSTUDIO_MODEL", "").strip()
+        return self._loaded_rel() or self.env.get("LMSTUDIO_MODEL", "").strip()
 
     def resolve_model(self, model: str = "") -> str:
-        """Приоритет: явный выбор пользователя → модель последнего чата → default из .env."""
-        return ((model or "").strip() or (self.active_model or "").strip()
-                or self.default_rel())
+        """Приоритет: явный выбор → загруженная модель → последний чат → .env."""
+        explicit = (model or "").strip()
+        if explicit:
+            return explicit
+        return self._loaded_rel() or (self.active_model or "").strip() or self.default_rel()
 
     def model_id(self) -> str:
         """Идентификатор выбранной модели без смены выбора и без ensure.
@@ -468,27 +490,53 @@ class App:
             allowed = [n for n in allowed if n in requested] or allowed
         sid = "s" + uuid.uuid4().hex[:6]
         lim = self.limits
-        system = SUBAGENT_PERSONA
-        if origin:
-            system += f"\n\nОбщий вопрос пользователя (для контекста, не отвечай на него целиком): {_preview(origin, 600)}"
-        ins = instructions(allowed, tools.specs(allowed))
-        if ins:
-            system += "\n\n" + ins
-        messages: List[dict] = [{"role": "system", "content": system}, {"role": "user", "content": task}]
-        target = self.resolve_model()
-        # Кастомные бэкенды в тестах могут не принимать max_tokens — не ломаем их.
+        sub_rounds = lim["sub_rounds"]          # 0 — пока не вернёт текст
+        per_step = lim["calls_per_step"] or 10 ** 6
+        # Кастомные бэкенды в тестах могут не принимать max_tokens/tools — не ломаем их.
         try:
             sp = inspect.signature(self.backend.stream).parameters
         except (TypeError, ValueError):
             sp = {}
+        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sp.values())
         stream_kwargs = ({"max_tokens": lim["agent_max_tokens"]}
-                         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sp.values())
-                         or "max_tokens" in sp else {})
+                         if has_kwargs or "max_tokens" in sp else {})
+        specs = tools.specs(allowed)
+        native_names = allowed[:lim["native_max"]] if lim["native_max"] else allowed
+        native_tools = None
+        if self.env.get("TOOL_NATIVE", "0") == "1" and native_names and (has_kwargs or "tools" in sp):
+            native_tools = [{"type": "function", "function": {
+                "name": n,
+                "description": (specs.get(n) or {}).get("description", ""),
+                "parameters": (specs.get(n) or {}).get("parameters") or
+                              {"type": "object", "properties": {}},
+            }} for n in native_names]
+            stream_kwargs["tools"] = native_tools
+        # Теговый вызов <tool>значение</tool> разбирается по первому обязательному
+        # параметру схемы — как и в основном ходе.
+        primary: Dict[str, str] = {}
+        for _n, _s in specs.items():
+            _req = (_s.get("parameters") or {}).get("required") or []
+            if _req:
+                primary[_n] = _req[0]
+            elif "query" in ((_s.get("parameters") or {}).get("properties") or {}):
+                primary[_n] = "query"
+        system = SUBAGENT_PERSONA
+        if origin:
+            system += f"\n\nОбщий вопрос пользователя (для контекста, не отвечай на него целиком): {_preview(origin, 600)}"
+        ins = instructions(allowed, specs, native=bool(native_tools))
+        if ins:
+            system += "\n\n" + ins
+        messages: List[dict] = [{"role": "system", "content": system}, {"role": "user", "content": task}]
+        target = self.resolve_model()
 
         def sub_delta(kind, payload):
+            if kind == "finish":
+                return                    # служебный маркер обрезки, не текст ответа
             if kind == "tool" and isinstance(payload, dict):
                 payload = {**payload, "sub": sid}
             on_delta(kind, payload)
+
+        rnd = 0
 
         def emit_sub_step(phase: str, state: str, label: str, detail: str) -> None:
             on_delta("step", {"id": f"{sid}-r{rnd + 1}", "round": 0, "phase": phase,
@@ -496,37 +544,78 @@ class App:
 
         calls = 0
         final = ""
-        for rnd in range(lim["sub_rounds"] + 1):
+        while not cancelled():
             emit_sub_step("start", "running", f"Субагент · шаг {rnd + 1}",
                           f"подзадача: {_preview(task, 120)}")
             _fit_messages(messages, lim["context_max"])
-            flt = ToolCallFilter(allowed)
+            flt = ToolCallFilter(allowed, primary)
             visible: List[str] = []
+            native_calls: List[dict] = []
 
             def tok(kind, text, flt=flt, visible=visible):
                 if kind == "token":
                     visible.append(flt.feed(text))
+                elif kind == "native_tool_calls" and isinstance(text, list):
+                    native_calls.extend(text)
 
             with self._llm_slot:
                 self.backend.stream(target, messages, tok, cancelled=cancelled, **stream_kwargs)
+            if getattr(self.backend, "last_native_unsupported", False) and native_tools is not None:
+                native_tools = None
+                stream_kwargs.pop("tools", None)
+                emit_sub_step("note", "warning", "Function calling",
+                              "сервер отклонил tools — субагент перешёл на <tool_call>")
+                messages.append({"role": "user", "content":
+                                 "Сервер не принял function calling. Для вызовов используй "
+                                 "только <tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call>."})
             visible.append(flt.finish())
             text = "".join(visible).strip()
-            raw = flt.calls_raw[: lim["calls_per_step"]]
-            if not raw:
-                bare = find_bare_call(text, allowed)
-                if bare is not None:
-                    raw = [json.dumps({"name": bare["name"],
-                                       "arguments": bare.get("arguments") or {}},
-                                      ensure_ascii=False)]
-            if not raw or rnd == lim["sub_rounds"] or cancelled():
+            use_native = native_tools is not None
+            normalized: List[dict] = []
+            if use_native:
+                for c in native_calls:
+                    item = {"id": c.get("id") or ("call_" + uuid.uuid4().hex[:8]),
+                            "name": c.get("name") or "?", "arguments": c.get("arguments") or {}}
+                    if c.get("error"):
+                        item["error"] = c["error"]
+                    normalized.append(item)
+                for raw in flt.calls_raw:
+                    parsed = parse_calls([raw], allowed)[0]
+                    item = {"id": "call_" + uuid.uuid4().hex[:8],
+                            "name": parsed.get("name") or "?",
+                            "arguments": parsed.get("arguments") or {}}
+                    if parsed.get("error"):
+                        item["error"] = parsed["error"]
+                    normalized.append(item)
+            else:
+                raw = flt.calls_raw[:per_step]
+                if not raw:
+                    bare = find_bare_call(text, allowed)
+                    if bare is not None:
+                        raw = [json.dumps({"name": bare["name"],
+                                           "arguments": bare.get("arguments") or {}},
+                                          ensure_ascii=False)]
+                normalized = parse_calls(raw, allowed)
+            normalized = normalized[:per_step]
+            if not normalized or (sub_rounds and rnd >= sub_rounds):
                 emit_sub_step("end", "done", f"Субагент · шаг {rnd + 1}",
                               f"итог: {_preview(text, 140) or 'без текста'}")
                 final = text
                 break
-            messages.append({"role": "assistant",
-                             "content": text + "".join(f"<tool_call>{r}</tool_call>" for r in raw)})
+            if use_native:
+                messages.append({"role": "assistant", "content": text, "tool_calls": [
+                    {"id": c["id"], "type": "function", "function": {
+                        "name": c["name"],
+                        "arguments": json.dumps(c["arguments"], ensure_ascii=False)}}
+                    for c in normalized]})
+            else:
+                messages.append({"role": "assistant",
+                                 "content": text + "".join(
+                                     f"<tool_call>{json.dumps(c, ensure_ascii=False)}</tool_call>"
+                                     for c in flt.calls_raw[:per_step])})
             blocks: List[str] = []
-            for call in parse_calls(raw, allowed):
+            tool_msgs: List[dict] = []
+            for call in normalized:
                 name = call.get("name") or "?"
                 args = call.get("arguments") or {}
                 calls += 1
@@ -536,8 +625,8 @@ class App:
                     out = Outcome(False, f"Субагенту недоступен инструмент {name}. "
                                          f"Доступны: {', '.join(allowed) or 'нет'}.",
                                   label="Инструмент", detail=name)
-                    sub_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name, "status": "error",
-                                       "step": rnd + 1,
+                    sub_delta("tool", {"id": "t" + uuid.uuid4().hex[:8], "name": name,
+                                       "status": "error", "step": rnd + 1,
                                        "label": f"Нет доступа у субагента: {name}",
                                        "detail": "субагенту не разрешено", "preview": ""})
                 else:
@@ -546,10 +635,22 @@ class App:
                     except Exception as exc:          # noqa: BLE001 — сбой инструмента не срывает субагента
                         out = Outcome(False, f"Ошибка инструмента {name}: {exc}", label="Инструмент",
                                       detail=_preview(str(exc), 120))
-                blocks.append(tool_result_block(name, out.text, lim["result_chars"]))
-            messages.append({"role": "user", "content": "\n".join(blocks)})
+                body, truncated, _ = compact_model_text(out.text, lim["result_chars"])
+                if use_native:
+                    tool_msgs.append({"role": "tool",
+                                      "tool_call_id": call.get("id") or "", "content": body})
+                else:
+                    blocks.append(tool_result_block(name, body, lim["result_chars"]))
+            if use_native:
+                messages.extend(tool_msgs)
+            else:
+                messages.append({"role": "user", "content": "\n".join(blocks)})
             emit_sub_step("end", "done", f"Субагент · шаг {rnd + 1}",
-                          f"вызовов: {len(raw)}, результатов: {len(blocks)}")
+                          f"вызовов: {len(normalized)}, результатов: "
+                          f"{len(tool_msgs) if use_native else len(blocks)}")
+            rnd += 1
+        if cancelled():
+            emit_sub_step("end", "done", "Субагент", "остановлен")
         return Outcome(True, final or "Субагент не дал ответа.", label=f"Субагент: «{_preview(task, 60)}»",
                        detail=f"вызовов: {calls}")
 
@@ -673,9 +774,10 @@ class App:
         """Ход чата. Пока он идёт, индексация ждёт: модель занята ответом."""
         with self._busy_cv:
             self._chat_busy += 1
+            stop_epoch = self.stop_epoch
         try:
             return self._chat_impl(message, chat_id, on_delta, cancelled=cancelled, web=web,
-                                   model=model, uid=uid)
+                                   model=model, uid=uid, stop_epoch=stop_epoch)
         finally:
             with self._busy_cv:
                 self._chat_busy -= 1
@@ -683,7 +785,7 @@ class App:
 
     def _chat_impl(self, message: str, chat_id: str, on_delta: Callable[[str, object], None],
                    cancelled: Optional[Callable[[], bool]] = None, web: bool = False, model: str = "",
-                   uid: Optional[str] = None) -> str:
+                   uid: Optional[str] = None, stop_epoch: int = 0) -> str:
         """Ход чата с инструментами.
 
         on_delta(kind, payload):
@@ -694,18 +796,25 @@ class App:
         web — разрешить веб-инструменты в этом ходе; model — модель для этого ответа
         (пусто — модель по умолчанию из настроек). Возвращает итоговый текст ответа.
         """
-        # stop_flag — глобальный аварийный выключатель; пер-чатовая отмена приходит
-        # через cancelled(). Раньше флаг сбрасывался в начале каждого хода и мог
-        # отменить соседний чат.
+        # stop_flag — глобальный аварийный выключатель, но он не должен «залипать»:
+        # ход отменяется только если epoch изменился ПОСЛЕ его старта. Пер-чатовая
+        # отмена приходит через cancelled().
         def is_cancelled() -> bool:
-            return bool(cancelled and cancelled()) or self.stop_flag
+            return bool(cancelled and cancelled()) or self.stop_epoch != stop_epoch
 
-        lim = self.limits
-        per_step = lim["calls_per_step"]
+        # Копия лимитов: при обрезке по длине бюджет генерации этого хода
+        # увеличивается, но глобальные настройки приложения не меняются.
+        lim = dict(self.limits)
+        gen_tokens = int(lim["agent_max_tokens"])
+        per_step = lim["calls_per_step"] or 10 ** 6
         max_rounds = lim["max_rounds"]
         max_calls = lim["max_calls"]
+        # 0/0 — безлимитный агент: работает, пока сам не даст итоговый текст.
+        unlimited = max_rounds == 0 and max_calls == 0
+        max_cont = lim["max_continuations"]
         reflection = lim["reflection_budget"]
         rounds = calls_used = failures = fail_streak = idle_rounds = bad_streak = 0
+        continuations = truncations = 0
         seen_calls: Dict[str, Outcome] = {}
         shown_notes: set = set()          # пояснения о сокращении контекста — один раз за ход
         trace: List[str] = []
@@ -717,8 +826,9 @@ class App:
         def budget() -> dict:
             return {"round": rounds, "max_rounds": max_rounds,
                     "calls": calls_used, "max_calls": max_calls,
-                    "remaining_rounds": max(0, max_rounds - rounds),
-                    "remaining_calls": max(0, max_calls - calls_used)}
+                    "remaining_rounds": max(0, max_rounds - rounds) if max_rounds else -1,
+                    "remaining_calls": max(0, max_calls - calls_used) if max_calls else -1,
+                    "unlimited": unlimited}
 
         def emit_step(round_no: int, phase: str, state: str, label: str, detail: str,
                       sid: str = "", **extra) -> None:
@@ -763,6 +873,28 @@ class App:
                 primary[_name] = _required[0]
             elif "query" in (_params.get("properties") or {}):
                 primary[_name] = "query"
+        # Схемы нужны и для системной инструкции, и для запроса к модели.
+        # TOOL_NATIVE_MAX=0 — отправляем все доступные схемы.
+        native_tools = None
+        if self.env.get("TOOL_NATIVE", "0") == "1" and names:
+            native_names = names[:lim["native_max"]] if lim["native_max"] else names
+            native_tools = [{"type": "function", "function": {
+                "name": n,
+                "description": (specs.get(n) or {}).get("description", ""),
+                "parameters": (specs.get(n) or {}).get("parameters") or {"type": "object", "properties": {}},
+            }} for n in native_names]
+        # Тестовые/кастомные бэкенды могут иметь более узкую сигнатуру stream(),
+        # чем OpenAICompat. Не ломаем: передаём только поддерживаемые аргументы.
+        try:
+            stream_params = inspect.signature(self.backend.stream).parameters
+        except (TypeError, ValueError):
+            stream_params = {}
+        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in stream_params.values())
+
+        def supported(name: str) -> bool:
+            return has_kwargs or name in stream_params
+
+        native_enabled = bool(native_tools) and supported("tools")
         parts: List[str] = []
 
         def emit_text(text: str) -> None:
@@ -791,7 +923,7 @@ class App:
         if mem:
             system.append(mem)
         if names:
-            system.append(instructions(names, specs))
+            system.append(instructions(names, specs, native=native_enabled))
         system_text = "\n\n".join(system)
         if len(system_text) > lim["system_max"]:
             before = len(system_text)
@@ -806,8 +938,8 @@ class App:
         for notice in fit_notes:
             emit_step(0, "note", "warning", "Контекст", notice)
 
-        # Единственное место, где выбор модели меняется: явный model из запроса
-        # (пользователь выбрал в интерфейсе) или стабильный default из настроек.
+        # Выбор модели: явный model из запроса (пользователь выбрал в интерфейсе)
+        # или модель, реально загруженная в LM Studio. Факты идут той же моделью.
         target = self.resolve_model(model)
         rel = target or "local"
         ensure_error: Optional[Exception] = None
@@ -820,16 +952,8 @@ class App:
             ensure_error = exc
 
         # 3) агентный цикл: запрос → инструменты → реакт → инструменты → ... → ответ.
-        # Нативный function calling — опция (TOOL_NATIVE=1). По умолчанию текстовый протокол:
-        # локальные 26B-модели часто не умеют tool_calls, а llm.py при HTTP 400 откатывается.
-        native_tools = None
-        if self.env.get("TOOL_NATIVE", "0") == "1" and names:
-            native_tools = [{"type": "function", "function": {
-                "name": n,
-                "description": (specs.get(n) or {}).get("description", ""),
-                "parameters": (specs.get(n) or {}).get("parameters") or {"type": "object", "properties": {}},
-            }} for n in names[:lim["native_max"]]]
-
+        # Нативный function calling — опция (TOOL_NATIVE=1); llm.py откатывается
+        # на текстовый <tool_call> при HTTP 400/404/422 без переполнения контекста.
         FINAL_REASONS = {
             "round_limit": "Достигнут лимит шагов — отвечаю по собранным результатам.",
             "call_limit": "Достигнут лимит вызовов инструментов — отвечаю по собранным результатам.",
@@ -852,20 +976,11 @@ class App:
                     native_buf.extend(payload)
                 elif kind == "native_unsupported":
                     flags["native_unsupported"] = True
+                elif kind == "finish":
+                    flags["finish_reason"] = payload
                 else:
                     on_delta(kind, payload)
             return sink
-
-        # Тестовые/кастомные бэкенды могут иметь более узкую сигнатуру stream(),
-        # чем OpenAICompat. Не ломаем их: передаём только поддерживаемые аргументы.
-        try:
-            stream_params = inspect.signature(self.backend.stream).parameters
-        except (TypeError, ValueError):
-            stream_params = {}
-        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in stream_params.values())
-
-        def supported(name: str) -> bool:
-            return has_kwargs or name in stream_params
 
         def tool_accepts_step() -> bool:
             # _call_tool могут подменить в тестах более узкой сигнатурой.
@@ -876,13 +991,20 @@ class App:
             return ("step" in params or
                     any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()))
 
+        _OVERFLOW_MARKERS = ("context length", "context window", "too long", "exceed",
+                             "n_ctx", "context is full", "prompt is too large")
+
+        def looks_overflow(exc: BaseException) -> bool:
+            low = str(exc).lower()
+            return any(marker in low for marker in _OVERFLOW_MARKERS)
+
         def stream_once(msgs, tool_list, sink, flt, buf, native_buf, flags) -> Optional[llm.BackendError]:
             err: Optional[llm.BackendError] = None
             for attempt in range(LLM_RETRIES + 1):
                 try:
                     kwargs = {"cancelled": is_cancelled}
                     if supported("max_tokens"):
-                        kwargs["max_tokens"] = lim["agent_max_tokens"]
+                        kwargs["max_tokens"] = gen_tokens
                     if tool_list and supported("tools"):
                         kwargs["tools"] = tool_list
                     self.backend.stream(rel, msgs, sink, **kwargs)
@@ -895,6 +1017,17 @@ class App:
                     # Повторяем, только если пользователь ещё ничего не увидел.
                     if buf or native_buf or flt.calls_raw or is_cancelled() or attempt == LLM_RETRIES:
                         break
+                    if looks_overflow(err):
+                        # Переполнение контекста: повтор того же запроса бесполезен.
+                        size = sum(_msg_size(m) for m in msgs)
+                        notes = _fit_messages(msgs, max(1200, size // 2))
+                        if notes:
+                            flags["context_trimmed"] = notes
+                    # После обрыва в фильтре мог остаться начало тега — чистим перед повтором.
+                    flt.reset()
+                    buf.clear()
+                    native_buf.clear()
+                    flags.pop("finish_reason", None)
                     time.sleep(LLM_RETRY_DELAY * (attempt + 1))
             return err
 
@@ -911,17 +1044,18 @@ class App:
             # Причина финала определяется ДО запроса к модели: последний вызов
             # всегда делается с явной просьбой дать текст, а не с выбрасыванием tool_call.
             force_stop = ""
-            if fail_streak >= FAIL_STREAK_LIMIT:
-                force_stop = "failures"
-            elif bad_streak >= BAD_ROUNDS_LIMIT:
-                force_stop = "bad_calls"
-            elif idle_rounds >= IDLE_ROUNDS_LIMIT:
-                # Два раунда подряд модель лишь повторяла уже сделанные вызовы — прогресса нет.
-                force_stop = "no_progress"
-            elif rounds >= max_rounds:
-                force_stop = "round_limit"
-            elif calls_used >= max_calls:
-                force_stop = "call_limit"
+            if not unlimited:
+                if fail_streak >= FAIL_STREAK_LIMIT:
+                    force_stop = "failures"
+                elif bad_streak >= BAD_ROUNDS_LIMIT:
+                    force_stop = "bad_calls"
+                elif idle_rounds >= IDLE_ROUNDS_LIMIT:
+                    # Два раунда подряд модель лишь повторяла уже сделанные вызовы — прогресса нет.
+                    force_stop = "no_progress"
+                elif max_rounds and rounds >= max_rounds:
+                    force_stop = "round_limit"
+                elif max_calls and calls_used >= max_calls:
+                    force_stop = "call_limit"
 
             if force_stop:
                 stop_reason = force_stop
@@ -942,6 +1076,12 @@ class App:
                 if tail:
                     buf.append(tail)
                     emit_text(tail)
+                if flags.get("context_trimmed"):
+                    emit_step(rounds + 1, "note", "warning", "Контекст",
+                              "запрос был слишком длинным — старые реплики убраны, запрос повторён")
+                if flags.get("finish_reason") == "length":
+                    emit_step(rounds + 1, "note", "warning", "Ответ обрезан",
+                              "модель достигла лимита токенов на финальном шаге")
                 if err is not None:
                     self.log_error("модель", err)
                     stop_reason = "llm_error"
@@ -964,7 +1104,7 @@ class App:
                 emit_step(current, "note", "warning", "Контекст", notice)
             ctx_size = sum(len(str(m.get("content") or "")) for m in messages)
             emit_step(current, "start", "running", f"Шаг {current} · модель",
-                      f"контекст ~{ctx_size} симв.; лимит генерации {lim['agent_max_tokens']} токенов")
+                      f"контекст ~{ctx_size} симв.; лимит генерации {gen_tokens} токенов")
             flt = ToolCallFilter(names, primary)
             step: List[str] = []
             native: List[dict] = []
@@ -975,10 +1115,25 @@ class App:
                 native_tools = None       # sticky на весь ход: не шлём tools каждый раунд
                 emit_step(current, "note", "warning", "Function calling",
                           "Сервер отклонил схемы tools — перешли на текстовый протокол <tool_call>")
+                messages.append({"role": "user", "content":
+                                 "Сервер не принял function calling. Для вызовов инструментов "
+                                 "используй только <tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call> "
+                                 "и остановись после блока."})
             tail = flt.finish()
             if tail:
                 step.append(tail)
                 emit_text(tail)
+            if flags.get("context_trimmed"):
+                emit_step(current, "note", "warning", "Контекст",
+                          "запрос был слишком длинным — старые реплики убраны, запрос повторён")
+            finish = str(flags.get("finish_reason") or "")
+            if finish == "length":
+                # Ответ/вызов оборван не по воле модели, а по лимиту генерации.
+                # Увеличиваем бюджет этого хода и даём модели шанс договорить.
+                truncations += 1
+                gen_tokens = min(8192, max(gen_tokens + 512, int(gen_tokens * 1.5)))
+                emit_step(current, "note", "warning", "Лимит генерации",
+                          f"модель остановилась по лимиту токенов; бюджет хода повышен до {gen_tokens}")
 
             if err is not None:
                 self.log_error("модель", err)
@@ -989,29 +1144,69 @@ class App:
                 stop_reason = "cancelled"
                 break
 
-            # Смешанные вызовы не теряем: текстовые <tool_call> добавляем к нативным.
-            native_mode = bool(native)
-            if native and flt.calls_raw:
-                emit_step(current, "note", "warning", "Смешанные вызовы",
-                          "Модель выдала и native tool_calls, и <tool_call> — объединяем их")
-                for raw in flt.calls_raw:
-                    parsed = parse_calls([raw], names)[0]
-                    native.append({"id": "call_" + uuid.uuid4().hex[:8],
-                                   "name": parsed.get("name") or "?",
-                                   "arguments": parsed.get("arguments") or {}})
-            total_calls = len(native) if native_mode else len(flt.calls_raw)
+            # Приводим все вызовы к одному списку. В native-режиме текстовые <tool_call>
+            # тоже отправляем как function-calls с id: иначе одно и то же действие уходит
+            # дважды — тегом в content и массивом tool_calls.
+            # Бэкенд мог получить только текстовую инструкцию, если его stream()
+            # не принимает tools. Тогда и историю пишем текстовым протоколом.
+            native_mode = native_enabled and bool(native_tools)
+            calls: List[dict] = []
+            if native_mode:
+                for c in native:
+                    item = {"id": c.get("id") or ("call_" + uuid.uuid4().hex[:8]),
+                            "name": c.get("name") or "?",
+                            "arguments": c.get("arguments") or {}}
+                    if c.get("error"):
+                        item["error"] = c["error"]   # оборванный JSON не исполняем
+                    calls.append(item)
+                if native and flt.calls_raw:
+                    emit_step(current, "note", "warning", "Смешанные вызовы",
+                              "Модель выдала и native tool_calls, и <tool_call> — объединяем их")
+                for text_raw in flt.calls_raw:
+                    parsed = parse_calls([text_raw], names)[0]
+                    item = {"id": "call_" + uuid.uuid4().hex[:8],
+                            "name": parsed.get("name") or "?",
+                            "arguments": parsed.get("arguments") or {}}
+                    if parsed.get("error"):
+                        item["error"] = parsed["error"]
+                    calls.append(item)
+            total_calls = len(calls) if native_mode else len(flt.calls_raw)
             if total_calls > per_step:
                 emit_step(current, "note", "warning", "Лимит вызовов шага",
                           f"принято {per_step} из {total_calls} вызовов этого шага")
+            accepted_calls = calls[:per_step] if native_mode else []
             if native_mode:
-                accepted = native[:per_step]
-                raw_calls = [json.dumps({"name": c.get("name") or "?", "arguments": c.get("arguments") or {}},
-                                        ensure_ascii=False) for c in accepted]
+                raw_calls = []
+                for c in accepted_calls:
+                    item = {"name": c["name"], "arguments": c["arguments"]}
+                    if c.get("error"):
+                        item["error"] = c["error"]
+                    raw_calls.append(json.dumps(item, ensure_ascii=False))
             else:
                 raw_calls = flt.calls_raw[:per_step]
 
+            raw_step = "".join(step)
+            # Нативный вызов с оборванными аргументами уже размечен error в llm.py —
+            # он возвращается модели как результат инструмента, а не вызывает повтор.
+            has_broken = any(c.get("error") for c in parse_calls(raw_calls, names))
+            if (finish == "length" and raw_calls and not has_broken and
+                    (max_cont == 0 or continuations < max_cont)):
+                # Вызов инструмента оборвался посреди JSON: выполнять нельзя.
+                # Просим модель повторить его компактно или ответить текстом.
+                # В нативном режиме оборванный assistant без обязательных role:tool
+                # вызывает HTTP 400 у части серверов — оставляем только просьбу повторить.
+                if not native_mode:
+                    messages.append({"role": "assistant", "content": raw_step})
+                messages.append({"role": "user", "content":
+                                 "Предыдущий ответ оборвался по лимиту токенов на вызове инструмента. "
+                                 "Повтори вызов целиком компактно или ответь текстом без инструментов."})
+                continuations += 1
+                rounds = current
+                emit_step(current, "end", "error", f"Шаг {current} · результаты",
+                          "вызов инструмента оборван — прошу повторить его целиком")
+                continue
+
             if not raw_calls:
-                raw_step = "".join(step)
                 if getattr(flt, "fake_results", 0):
                     emit_step(current, "note", "warning", "Поддельный результат",
                               "Модель написала <tool_result> сама — игнорирую и прошу сделать настоящий <tool_call>")
@@ -1046,24 +1241,44 @@ class App:
                     emit_step(current, "note", "warning", "Вызов без тегов",
                               f"инструмент {bare['name']} выполнен: модель написала вызов без <tool_call>")
                 else:
-                    stop_reason = "model_done"
                     reply = raw_step.strip()
+                    # Пустой ответ или обрезка по длине — не повод заканчивать ход.
+                    # Один-два запроса с уточнением возвращают модель к делу.
+                    if (max_cont == 0 or continuations < max_cont) and (
+                            (finish == "length" and reply) or
+                            (not reply and (finish == "length" or
+                                            (not raw_step)))):
+                        messages.append({"role": "assistant", "content": raw_step})
+                        if finish == "length" and reply:
+                            prompt = ("Продолжи предыдущий ответ с места обрыва, "
+                                      "не повторяя уже написанное.")
+                        elif finish == "length":
+                            prompt = ("Рассуждения оборвались по лимиту токенов. "
+                                      "Дай короткий итоговый ответ текстом, без рассуждений.")
+                        else:
+                            prompt = "Дай итоговый ответ текстом: предыдущий ответ был пустым."
+                        messages.append({"role": "user", "content": prompt})
+                        continuations += 1
+                        rounds = current
+                        emit_step(current, "note", "warning", "Продолжение ответа", prompt)
+                        continue
+                    stop_reason = "model_done"
                     emit_step(current, "end", "done", f"Шаг {current} · результаты",
                               "инструменты не нужны — модель ответила текстом" if reply
                               else "инструменты не нужны — модель не дала текста")
                     break
 
             rounds = current
-            assistant = {"role": "assistant",
-                         "content": "".join(step) + "".join(f"<tool_call>{r}</tool_call>" for r in raw_calls)}
             if native_mode:
-                assistant["tool_calls"] = []
-                for c in native[:per_step]:
-                    tid = c.get("id") or ("call_" + uuid.uuid4().hex[:8])
-                    c["id"] = tid
-                    assistant["tool_calls"].append({"id": tid, "type": "function", "function": {
-                        "name": c.get("name") or "?",
-                        "arguments": json.dumps(c.get("arguments") or {}, ensure_ascii=False)}})
+                # content остаётся чистым текстом: вызовы идут только в tool_calls.
+                assistant = {"role": "assistant", "content": raw_step, "tool_calls": [
+                    {"id": c["id"], "type": "function", "function": {
+                        "name": c["name"],
+                        "arguments": json.dumps(c["arguments"], ensure_ascii=False)}}
+                    for c in accepted_calls]}
+            else:
+                assistant = {"role": "assistant",
+                             "content": raw_step + "".join(f"<tool_call>{r}</tool_call>" for r in raw_calls)}
             messages.append(assistant)
             # 1) разбор по порядку: повторы, ошибки, недоступные и пропущенные вызовы — без исполнения;
             # 2) исполнение: независимые вызовы — параллельно, инструменты записи — по очереди;
@@ -1073,7 +1288,7 @@ class App:
             for idx, call in enumerate(parse_calls(raw_calls, names)):
                 name = call.get("name") or "?"
                 args = call.get("arguments") or {}
-                if calls_used >= max_calls:
+                if max_calls and calls_used >= max_calls:
                     # Не break: каждое объявленное tool_calls обязано получить свой role:tool,
                     # иначе следующий запрос к OpenAI-совместимому серверу упадёт с HTTP 400.
                     out = Outcome(False, "Лимит вызовов инструментов исчерпан — вызов пропущен.",
@@ -1163,8 +1378,9 @@ class App:
                                    "error": "" if out.ok else _preview(out.text, 180)})
                 trace.append(f"{name}({_args_preview(it.get('args') or {}, 60)})→"
                              f"{_preview(out.text, 70)}{'✕' if not out.ok else '✓'}")
-                if native_mode and idx < len(native):
-                    native_msgs.append({"role": "tool", "tool_call_id": native[idx].get("id") or "",
+                if native_mode and idx < len(accepted_calls):
+                    native_msgs.append({"role": "tool",
+                                        "tool_call_id": accepted_calls[idx]["id"],
                                         "content": body})
 
             # Прогресс: раунд без новых выполнений (одни повторы и кэш) — холостой.
@@ -1176,9 +1392,13 @@ class App:
                 reflection -= 1
                 hint = ("Инструмент вернул ошибку. Измени аргументы, выбери другой инструмент "
                         "или ответь по уже собранным данным — не выдумывай результат.")
-            next_is_final = (rounds >= max_rounds or calls_used >= max_calls or
-                             fail_streak >= FAIL_STREAK_LIMIT or idle_rounds >= IDLE_ROUNDS_LIMIT or
-                             bad_streak >= BAD_ROUNDS_LIMIT)
+            limit_hit = bool((max_rounds and rounds >= max_rounds) or
+                             (max_calls and calls_used >= max_calls))
+            if not unlimited:
+                limit_hit = limit_hit or (fail_streak >= FAIL_STREAK_LIMIT or
+                                          idle_rounds >= IDLE_ROUNDS_LIMIT or
+                                          bad_streak >= BAD_ROUNDS_LIMIT)
+            next_is_final = limit_hit
             final_hint = ("Следующий ответ должен быть итоговым: ответь текстом по собранным "
                           "результатам, без новых вызовов инструментов.")
             tail = "\n\n".join(x for x in (hint, final_hint if next_is_final else "") if x)
@@ -1247,7 +1467,10 @@ class App:
         return answer
 
     def stop(self) -> None:
-        self.stop_flag = True
+        with self._busy_cv:
+            self.stop_flag = True
+            self.stop_epoch += 1
+            self._busy_cv.notify_all()
 
     def _embedder_status(self, mstats: dict) -> dict:
         """В MCP-режиме эмбеддер живёт в сервере памяти — врать про «не загружен» не нужно."""
@@ -1274,9 +1497,8 @@ class App:
                 online = False
         return {
             "backend": self.backend.name,
-            # Показываем модель, выбранную пользователем/чатом, а не «первую попавшуюся»
-            # загруженную в LM Studio: статус не должен меняться от чужих загрузок.
             "model": self.resolve_model() or None,
+            "loaded_model": self._loaded_rel() or None,
             "fact_model": self.extraction_model(),   # модель экстракции фактов
             "memory_enabled": self.memory_enabled,
             "memory_backend": self.memory_backend,

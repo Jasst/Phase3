@@ -124,6 +124,8 @@ def test_chat_writes_to_shared_memory_visible_to_owner_agents(mcp_stack, tmp_pat
 
 def test_chat_ingest_forwards_selected_model_to_mcp(mcp_stack, tmp_path, monkeypatch):
     app = _chat_app(tmp_path, mcp_stack["url"], mcp_stack["chat"])
+    # В этом тесте проверяем именно «липкий» выбор: реальный LM Studio не опрашиваем.
+    monkeypatch.setattr(app.backend, "loaded_model", lambda: "")
     app.active_model = "model-from-chat"
     calls = []
     real_call = app.memory.client.call
