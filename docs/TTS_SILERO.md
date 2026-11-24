@@ -1,15 +1,15 @@
 # Озвучка ответов: Silero TTS
 
 Русский голос работает локально: CPU, интернет не нужен после загрузки модели.
+Это движок по умолчанию (`TTS_ENGINE=silero`): модель `v4_ru.pt` (38 МБ) уже лежит в `data_unified/tts/`.
 
 ## Установка
 
-1. Зависимости (отдельно от основного проекта, torch большой). Ставить нужно **в `.venv`** —
-   именно его активирует `run_server.bat`. torch в глобальном Python серверу не виден:
+1. Зависимости (torch большой). Ставить нужно **в `.venv`** — именно его активирует
+   `run_server.bat`. torch в глобальном Python серверу не виден. Для CPU достаточно лёгкой сборки:
    ```
-   .venv\Scripts\python.exe -m pip install -r requirements-tts.txt
+   .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
    ```
-   Для CPU можно поставить лёгкую сборку torch с индекса PyTorch (команда в файле).
    Проверка: `.venv\Scripts\python.exe -c "import torch; print(torch.__version__)"`.
    Если в `/api/tts/status` в `error` написано `No module named 'torch'` — зависимость попала
    не в то окружение; после установки нажмите «Озвучить» ещё раз (старая ошибка сбросится)
@@ -28,6 +28,7 @@
 
 3. В `.env`:
    ```
+   TTS_ENGINE=silero
    SILERO_ENABLED=1
    # доступные голоса: aidar, baya, kseniya, xenia, eugene
    # это голос по умолчанию; пользователь может выбрать другой в интерфейсе

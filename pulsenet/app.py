@@ -27,7 +27,7 @@ from .triplex import TriplexMemory, make_extractor, openai_chat_caller
 from .triplex import sleep
 from .toolcalls import (COMMANDS, MAX_CALLS_PER_STEP, ToolCallFilter, agent_limits, find_bare_call,
                          find_bare_call_span, compact_model_text, parse_calls, parse_command,
-                         tool_result_block)
+                         strip_native_calls, tool_result_block)
 from .tools import SEQUENTIAL_TOOLS, SUBAGENT_DENY, ChatTools, Outcome, catalog, instructions
 from .unified_mcp.store import IdentityStore
 from .tts import make_tts
@@ -1201,7 +1201,10 @@ class App:
                 emit_step(current, "note", "warning", "Бюджет шагов",
                           "дальше только финальный текстовый ответ — новые вызовы не исполняются")
 
-        answer = "".join(parts).strip()
+        answer = strip_native_calls("".join(parts)).strip()
+        if answer != "".join(parts).strip():
+            # Служебные токены не должны попадать ни в сохранённый ответ, ни в TTS.
+            parts[:] = [answer] if answer else []
         # Защита от галлюцинаций протокола: модель написала <tool_result> как текст,
         # но реальных инструментов в этом ходу не было. Не сохраняем такой ответ.
         if stop_reason == "model_done" and "<tool_result" in answer.lower() and not trace:

@@ -21,6 +21,23 @@ from .tts import MAX_SEGMENT, TTSError, clean_for_speech, pcm_to_wav
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 DEFAULT_LANGUAGE = "ru"
 
+# Встроенные голоса XTTS-v2 (из speakers_xtts.pth). Список нужен до загрузки модели:
+# меню голосов должно быть рабочим сразу, а не после скачивания нескольких ГБ весов.
+BUILTIN_SPEAKERS = (
+    "Claribel Dervla", "Daisy Studious", "Gracie Wise", "Tammie Ema", "Alison Dietlinde",
+    "Ana Florence", "Annmarie Nele", "Asya Anara", "Brenda Stern", "Gitta Nikolina",
+    "Henriette Usha", "Sofia Hellen", "Tammy Grit", "Tanja Adelina", "Vjollca Johnnie",
+    "Andrew Chipper", "Badr Odhiambo", "Dionisio Schuyler", "Royston Min", "Viktor Eka",
+    "Abrahan Mack", "Adde Michal", "Baldur Sanjin", "Craig Gutsy", "Damien Black",
+    "Gilberto Mathias", "Ilkin Urbano", "Kazuhiko Atallah", "Ludvig Milivoj", "Suad Qasim",
+    "Torcull Diarmuid", "Viktor Menelaos", "Zacharie Aimilios", "Nova Hogarth", "Maja Ruoho",
+    "Uta Obando", "Lidiya Szekeres", "Chandra MacFarland", "Szofi Granger", "Camilla Holmström",
+    "Lilya Stainthorpe", "Zofija Kendrick", "Narelle Moon", "Barbora MacLean", "Alexandra Hisakawa",
+    "Alma María", "Rosemary Okafor", "Ige Behringer", "Filip Traverse", "Damjan Chapman",
+    "Wulf Carlevaro", "Aaron Dreschner", "Kumar Dahl", "Eugenio Mataracı", "Ferran Simen",
+    "Xavier Hayasaka", "Luis Moray", "Marcos Rudaski",
+)
+
 
 def detect_language(text: str, default: str = DEFAULT_LANGUAGE) -> str:
     """Грубая проверка: если латинских букв заметно больше кириллических — английский, иначе default."""
@@ -60,21 +77,30 @@ class XTTSTTS:
     def reset_error(self) -> None:
         self.error = ""
 
+    def _speaker_names(self) -> list:
+        """Имена модель приоритетны; до загрузки используем известный список XTTS-v2."""
+        names = list(getattr(self._model, "speakers", None) or []) or list(BUILTIN_SPEAKERS)
+        if self.speaker and self.speaker not in names:
+            names = [self.speaker] + names      # свой голос из .env (например, после fine-tuning)
+        return names
+
     def normalize_speaker(self, value=None) -> str:
-        """Голос из запроса. Список голосов модели известен только после загрузки, поэтому проверка — в synth."""
-        return str(value or "").strip()
+        """Отсечь устаревшие id от других движков: XTTS не знает голосов aidar/xenia и т.п.
+
+        Пустое значение означает «голос по умолчанию» — движок подставит XTTS_SPEAKER
+        или первый голос модели.
+        """
+        name = str(value or "").strip()
+        if not name or self.speaker_wav:
+            return ""
+        return name if name in self._speaker_names() else ""
 
     def _voices(self) -> list:
         if self.speaker_wav:
             return [{"id": "", "label": "Образец голоса", "description": os.path.basename(self.speaker_wav),
                      "preview": ""}]
-        if self._model is not None:
-            names = list(getattr(self._model, "speakers", None) or [])
-            return [{"id": n, "label": n, "description": "встроенный голос XTTS", "preview": ""} for n in names]
-        # до загрузки список неизвестен: показываем заданный голос или подсказку
-        label = self.speaker or "первый голос модели"
-        return [{"id": self.speaker, "label": label, "description": "станет доступен после загрузки модели",
-                 "preview": ""}]
+        return [{"id": n, "label": n, "description": "встроенный голос XTTS", "preview": ""}
+                for n in self._speaker_names()]
 
     def status(self) -> dict:
         return {"enabled": self.enabled, "ready": self.ready, "engine": self.engine,
@@ -104,7 +130,18 @@ class XTTSTTS:
                 raise TTSError(msg)
             try:
                 os.environ.setdefault("COQUI_TOS_AGREED", "1")   # подтверждение лицензии для библиотеки
-                import torch                                      # тяжёлые импорты только при первом запросе
+                import transformers                               # тяжёлые импорты только при первом запросе
+                import torch
+                try:
+                    major = int(str(transformers.__version__).split(".", 1)[0])
+                except ValueError:
+                    major = 0
+                if major >= 5:
+                    msg = ("XTTS несовместим с transformers 5.x (generation передаёт cache вместо "
+                           "past_key_values). Установите 4.x: .venv\\Scripts\\python.exe -m pip install "
+                           "\"transformers>=4.57,<5\"")
+                    self.error = msg
+                    raise TTSError(msg)
                 from TTS.api import TTS
                 device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
                 model = TTS(self.model_name, progress_bar=False).to(device)

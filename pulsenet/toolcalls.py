@@ -19,6 +19,16 @@ from typing import Dict, Iterable, List, Optional, Tuple
 OPEN = "<tool_call>"
 CLOSE = "</tool_call>"
 
+# Gemma 4 (и некоторые другие локальные модели) выдают вызовы служебными токенами
+# с несимметричными скобками: <|tool_call>call:web_search(queries=["a"])<tool_call|>.
+# LM Studio отдаёт это обычным текстом в delta.content, поэтому формат надо
+# разбирать здесь, а не ждать native_tool_calls от сервера.
+NATIVE_OPEN = "<|tool_call>"
+NATIVE_CLOSE = ("<tool_call|>", "<|/tool_call|>", "<|tool_call_end|>")
+_NATIVE_OPEN_RE = re.compile(r"^<\s*\|\s*tool_call\s*(?:\|>|>)", re.I)
+_NATIVE_CLOSE_RE = re.compile(
+    r"^(?:<\s*tool_call\s*\|>|<\s*\|\s*/?\s*tool_call\s*\|>|<\s*\|\s*tool_call_end\s*\|>)", re.I)
+
 
 def _env_int(env: dict, key: str, default: int, lo: int = 1, hi: int = 100) -> int:
     try:
@@ -158,19 +168,268 @@ def _xml_call_body(name: str, raw: str, primary: Optional[Dict[str, str]] = None
     return json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
 
 
+# ---------- нативный протокол Gemma 4: <|tool_call>call:name(k=v)<tool_call|> ----------
+
+def _native_open_at(text: str, pos: int = 0) -> int:
+    """Длина открывающего служебного токена в text[pos:] (0 — его нет)."""
+    m = _NATIVE_OPEN_RE.match(text, pos)
+    return m.end() - pos if m else 0
+
+
+def _native_close_at(text: str, pos: int = 0) -> int:
+    """Длина закрывающего служебного токена в text[pos:] (0 — его нет)."""
+    m = _NATIVE_CLOSE_RE.match(text, pos)
+    return m.end() - pos if m else 0
+
+
+def _possible_native(tail: str) -> bool:
+    """Похож ли хвост на начало служебного токена (токены приходят по частям)."""
+    norm = re.sub(r"\s+", "", tail).lower()
+    if not norm.startswith("<"):
+        return False
+    markers = ("<|tool_call>", "<|tool_call|>", "<tool_call|>", "<|/tool_call|>", "<|tool_call_end|>")
+    return any(m.startswith(norm) for m in markers)
+
+
+def _native_may_continue(tail: str) -> bool:
+    """Ещё неполный вызов: имя и аргументы могут прийти несколькими кусками."""
+    norm = re.sub(r"\s+", "", tail).lower()
+    if not norm or "call:".startswith(norm):
+        return True
+    # Пока не закрылись скобки, держим весь хвост в буфере — иначе токены call:...
+    # просочатся пользователю. Конец потока обработает finish().
+    return bool(re.match(r"^call:[A-Za-z_][\w.-]*[\(\{]?$", norm)
+                or re.match(r"^call:[A-Za-z_][\w.-]*[\(\{]", norm))
+
+
+def _native_call_end(text: str, start: int) -> int:
+    """Индекс после балансированного call:name(...) / call:name{...}. -1 — вызов не полон."""
+    i = start
+    while i < len(text) and text[i].isspace():
+        i += 1
+    m = re.match(r"call\s*:\s*", text[i:], re.I)
+    if not m:
+        return -1
+    i += m.end()
+    m = re.match(r"[A-Za-z_][\w.-]*", text[i:])
+    if not m:
+        return -1
+    i += m.end()
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text) or text[i] not in "([{":
+        return -1
+    stack = [text[i]]
+    i += 1
+    quote = ""
+    while i < len(text):
+        ch = text[i]
+        if text.startswith('<|"|>', i) or text.startswith("<|'|>", i):
+            # Gemma экранирует кавычки служебным токеном <|"|> / <|'|> (5 символов).
+            qch = text[i + 2]
+            if not quote:
+                quote = qch
+            # внутри строки это экранированная кавычка — строку не закрываем
+            i += 5
+            continue
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if not stack:
+                return -1
+            stack.pop()
+            if not stack:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _split_top(text: str) -> List[str]:
+    """Разделить аргументы по запятым вне строк и вложенных скобок."""
+    parts: List[str] = []
+    buf: List[str] = []
+    stack: List[str] = []
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if text.startswith('<|"|>', i) or text.startswith("<|'|>", i):
+            buf.append('"')
+            i += 5
+            continue
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if stack:
+                stack.pop()
+        elif ch == "," and not stack:
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    if buf or parts:
+        parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def _top_separator(text: str) -> Optional[Tuple[int, str]]:
+    """Позиция первого разделителя key=value / key: value вне строк и скобок."""
+    stack: List[str] = []
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if stack:
+                stack.pop()
+        elif ch in "=:" and not stack:
+            return i, ch
+        i += 1
+    return None
+
+
+def _native_value(raw: str):
+    """Значение аргумента: JSON-литерал, Python-литерал или строка."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text[0] in ("'", '"') and len(text) > 1 and text[-1] == text[0]:
+        return text[1:-1]
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    plain = re.sub(r"\b(None|True|False)\b",
+                   lambda m: {"None": "null", "True": "true", "False": "false"}[m.group(1)], text)
+    try:
+        return json.loads(plain)
+    except ValueError:
+        return text
+
+
+def _native_args(name: str, inner: str, primary: Optional[Dict[str, str]] = None) -> dict:
+    parts = _split_top(inner)
+    if not parts:
+        return {}
+    if len(parts) == 1 and _top_separator(parts[0]) is None:
+        # Один позиционный аргумент: кладём его в основной аргумент инструмента
+        # (queries для поиска, prompt для генерации и т. д.).
+        canon = _xml_call_body(name, parts[0], primary)
+        try:
+            return json.loads(canon).get("arguments") or {}
+        except ValueError:
+            return {}
+    args: Dict[str, object] = {}
+    for part in parts:
+        sep = _top_separator(part)
+        if sep is None:
+            continue
+        key = part[:sep[0]].strip().strip("'\"")
+        if key:
+            args[key] = _native_value(part[sep[0] + 1:])
+    return args
+
+
+def _native_call_body(raw: str, primary: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Тело нативного вызова Gemma → канонический JSON вызова (или None)."""
+    text = str(raw or "").strip()
+    text = re.sub(r"^(?:<\s*\|\s*tool_call\s*(?:\|>|>)|\s)+", "", text)
+    text = re.sub(r"(?:<\s*tool_call\s*\|>|<\s*\|\s*/?\s*tool_call\s*\|?>|\s)+$", "", text)
+    # Внутри JSON-строки служебный токен кавычки должен стать экранированной кавычкой.
+    text = text.replace('<|"|>', '\\"').replace("<|'|>", "'")
+    m = re.match(r"call\s*:\s*([A-Za-z_][\w.-]*)\s*([\(\{])", text, re.I | re.S)
+    if not m:
+        return None
+    end = _native_call_end(text, 0)
+    if end < 0 or end <= m.end():
+        return None
+    name, bracket = m.group(1), m.group(2)
+    inner = text[m.end():end - 1]
+    if bracket == "{":
+        obj = _loose_json(inner)
+        args = obj if isinstance(obj, dict) else _native_args(name, inner, primary)
+    else:
+        args = _native_args(name, inner, primary)
+    return json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
+
+
+def strip_native_calls(text: str) -> str:
+    """Убрать утечки служебных токенов нативных вызовов из итогового текста."""
+    src = str(text or "")
+    out: List[str] = []
+    pos = 0
+    while pos < len(src):
+        m = re.search(r"<\s*\|\s*tool_call", src[pos:], re.I)
+        if not m:
+            out.append(src[pos:])
+            break
+        start = pos + m.start()
+        out.append(src[pos:start])
+        opened = _native_open_at(src, start)
+        end = _native_call_end(src, start + opened) if opened else -1
+        if end < 0:
+            close = re.search(r"<\s*tool_call\s*\|>|<\s*\|\s*/?\s*tool_call\s*\|>", src[start:], re.I)
+            end = start + (close.end() if close else len(src) - start)
+        pos = end
+    result = "".join(out)
+    for marker in NATIVE_CLOSE:
+        result = re.sub(re.escape(marker), "", result, flags=re.I)
+    # Gemma 4 добавляет пустой канонический блок сразу после нативного вызова.
+    result = re.sub(r"<\s*tool_call\s*>\s*</\s*tool_call\s*>", "", result, flags=re.I)
+    return result
+
+
 class ToolCallFilter:
     """Потоковый фильтр: отдаёт пользователю видимый текст и отделяет вызовы инструментов.
 
-    Понимает канонический <tool_call>{"name": ...}</tool_call> и теговый вариант
-    <web_search>...</web_search> (имя тега = имя доступного инструмента) — так локальные
-    модели тоже вызывают инструменты. feed() возвращает видимую часть очередного куска,
-    finish() — остаток после конца потока. Тела вызовов лежат в calls_raw уже каноническим
-    JSON, поэтому parse_calls разбирает оба варианта одинаково. Незакрытый блок тоже
-    попадает туда (на случай обрыва по лимиту токенов)."""
+    Понимает канонический <tool_call>{"name": ...}</tool_call>, теговый вариант
+    <web_search>...</web_search> и нативный формат Gemma 4
+    <|tool_call>call:web_search(queries=["..."])<tool_call|> — LM Studio отдаёт его
+    обычным текстом. feed() возвращает видимую часть очередного куска, finish() —
+    остаток после конца потока. Тела вызовов лежат в calls_raw уже каноническим JSON,
+    поэтому parse_calls разбирает все варианты одинаково. Незакрытый блок тоже попадает
+    туда (на случай обрыва по лимиту токенов)."""
 
     def __init__(self, names: Iterable[str] = (), primary: Optional[Dict[str, str]] = None):
         self.buf = ""
         self.inside = False
+        self.native = False          # внутри нативного вызова <|tool_call>call:...
         self.open_name = ""          # имя тега тегового вызова; "" — канонический <tool_call>
         self._open_tag = ""
         self.names = {str(n) for n in (names or ()) if n}
@@ -185,6 +444,9 @@ class ToolCallFilter:
             if self.inside:
                 if not self._consume_call():
                     break
+            elif self.native:
+                if not self._consume_native():
+                    break
             elif not self._consume_text(out):
                 break
         return "".join(out)
@@ -194,8 +456,19 @@ class ToolCallFilter:
         if self.inside:
             name, self.open_name = self.open_name, ""
             self.inside = False
-            self.calls_raw.append(_xml_call_body(name, rest, self.primary) if name else rest)
+            if name:
+                self.calls_raw.append(_xml_call_body(name, rest, self.primary))
+            elif rest.strip():
+                self.calls_raw.append(rest)
             return ""
+        if self.native:
+            self.native = False
+            # Поток оборвался посреди вызова: пробуем собрать его по открытым скобкам.
+            raw = "<|tool_call>" + rest
+            canon = _native_call_body(raw, self.primary)
+            if canon:
+                self.calls_raw.append(canon)
+            return ""                 # служебные токены никогда не показываем пользователю
         return rest
 
     def _consume_text(self, out: List[str]) -> bool:
@@ -209,9 +482,19 @@ class ToolCallFilter:
             if i:
                 out.append(self.buf[:i])
                 self.buf = self.buf[i:]
+            close = _native_close_at(self.buf)
+            if close:
+                self.buf = self.buf[close:]
+                continue
+            opened = _native_open_at(self.buf)
+            if opened:
+                self.buf = self.buf[opened:]
+                self.native = True
+                return True
             j = self.buf.find(">")
             if j < 0:
-                if self._possible_tag(self.buf) or self._possible_tool_result(self.buf):
+                if (self._possible_tag(self.buf) or self._possible_tool_result(self.buf)
+                        or _possible_native(self.buf)):
                     return False
                 out.append(self.buf[0])          # не тег инструмента — обычный текст
                 self.buf = self.buf[1:]
@@ -237,6 +520,31 @@ class ToolCallFilter:
             out.append(tag)
             self.buf = self.buf[j + 1:]
 
+    def _consume_native(self) -> bool:
+        """Прочитать один вызов <|tool_call>call:name(...) между служебными токенами."""
+        close = _native_close_at(self.buf)
+        if close:
+            self.buf = self.buf[close:]
+            self.native = False
+            return True
+        if re.match(r"^<\s*tool_call\s*>", self.buf, re.I):
+            # Модель добавила пустой канонический блок после нативного вызова.
+            self.native = False
+            return True
+        end = _native_call_end(self.buf, 0)
+        if end > 0:
+            raw = self.buf[:end]
+            self.buf = self.buf[end:]
+            self.native = False
+            canon = _native_call_body(raw, self.primary)
+            self.calls_raw.append(canon or raw)
+            return True
+        if _native_may_continue(self.buf.lstrip()) or _possible_native(self.buf):
+            return False
+        # Вместо вызова пошло обычное объяснение — не теряем его.
+        self.native = False
+        return True
+
     def _consume_call(self) -> bool:
         close = "</" + (self.open_name or "tool_call") + ">"
         i = self.buf.lower().find(close)
@@ -251,11 +559,14 @@ class ToolCallFilter:
         else:
             forced = re.search(r"""(?:name|tool)\s*=\s*["']?([A-Za-z_][\w-]*)""", tag or "", re.I)
             if forced:
-                obj = _load_call_body(body)
+                obj = _load_call_body(body) if body.strip() else {}
                 if isinstance(obj, dict) and not any(k in obj for k in _NAME_KEYS):
                     body = json.dumps({"name": forced.group(1).lower(), "arguments": obj},
                                       ensure_ascii=False)
-            self.calls_raw.append(body)
+            # Gemma 4 часто добавляет пустой <tool_call></tool_call> после нативного
+            # вызова. Раньше он превращался в «некорректный JSON» и сжигал раунд.
+            if body.strip():
+                self.calls_raw.append(body)
         return True
 
     def _consume_tool_result(self) -> Optional[bool]:
@@ -370,6 +681,9 @@ def parse_calls(raw_bodies: List[str], known: Optional[Iterable[str]] = None) ->
     known_set = set(known or ())
     calls: List[dict] = []
     for raw in raw_bodies:
+        native = _native_call_body(raw)
+        if native is not None:
+            raw = native
         obj = _load_call_body(raw)
         xmlish = _xmlish_call(raw)
         if not isinstance(obj, dict):
@@ -418,6 +732,15 @@ def find_bare_call_span(text: str, known: Iterable[str]) -> Optional[Tuple[dict,
     known_set = set(known or ())
     if not known_set or not text:
         return None
+    # Нативный вызов мог дойти до истории (например, из старого чата) — выполняем его.
+    for m in re.finditer(r"<\s*\|\s*tool_call", text, re.I):
+        opened = _native_open_at(text, m.start())
+        end = _native_call_end(text, m.start() + opened) if opened else -1
+        if end < 0:
+            continue
+        call = parse_calls([text[m.start():end]], known_set)[0]
+        if not call.get("error") and call["name"] in known_set:
+            return call, m.start(), end
     decoder = json.JSONDecoder()
     pos = 0
     while True:

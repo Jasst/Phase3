@@ -1,0 +1,10 @@
+# XTTS-v2 (TTS_ENGINE=xtts) — дополнительные зависимости поверх requirements-tts.txt.
+# Ставится в .venv, которым запускается сервер:
+#   .venv\Scripts\python.exe -m pip install -r requirements-tts-xtts.txt
+# torch CPU уже достаточно; если его нет:
+#   .venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+coqui-tts>=0.28
+six>=1.16
+# transformers 5.x передаёт в generate() ключ cache, а coqui XTTS ждёт past_key_values —
+# синтез падает с "'NoneType' object has no attribute 'get_seq_length'". Только 4.x.
+transformers>=4.57,<5

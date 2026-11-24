@@ -666,8 +666,8 @@ body.compact .welcome { padding: 16px 8px; }
   max-height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 16px);
   overflow-y: auto; overscroll-behavior: contain;
 }
-/* Выбор голоса Silero: строка = голос + описание, кнопка ▶ проигрывает пример. */
-.voice-menu { min-width: 268px; }
+/* Выбор голоса XTTS: строка = голос + описание, кнопка ▶ проигрывает пример. */
+.voice-menu { min-width: 268px; max-height: min(420px, 70dvh); overflow-y: auto; }
 .voice-menu-title {
   padding: 5px 10px 7px; font-size: 11px; letter-spacing: .04em;
   text-transform: uppercase; color: var(--text-muted);

@@ -1696,6 +1696,13 @@
         (st && st.enabled && !st.model_exists && !st.autodownload ? 'модель не найдена' : ''));
       if (st && Array.isArray(st.voices) && st.voices.length) ttsVoices = st.voices;
       if (st && st.speaker) ttsDefaultVoice = st.speaker;
+      // Голос из старых настроек (например, Silero) больше не существует у XTTS — сбрасываем,
+      // иначе меню подсвечивает несуществующий пункт, а синтез падает с «неизвестный голос».
+      if (settings.ttsVoice && ttsVoices.length &&
+          !ttsVoices.some((v) => v.id === settings.ttsVoice)) {
+        settings.ttsVoice = '';
+        saveSettings();
+      }
       applyVoiceButton();
     } catch (e) {
       ttsServer = false;
@@ -1981,11 +1988,9 @@
   function showVoiceMenu(anchor) {
     closeMenu();
     if (!ttsVoices.length) ttsVoices = [
-      { id: 'aidar', label: 'Айдар', description: 'низкий мужской' },
-      { id: 'baya', label: 'Бая', description: 'мягкий женский' },
-      { id: 'kseniya', label: 'Ксения', description: 'ровный женский' },
-      { id: 'xenia', label: 'Ксения 2', description: 'живой женский' },
-      { id: 'eugene', label: 'Евгений', description: 'мужской' },
+      { id: 'Claribel Dervla', label: 'Claribel Dervla', description: 'встроенный голос XTTS' },
+      { id: 'Daisy Studious', label: 'Daisy Studious', description: 'встроенный голос XTTS' },
+      { id: 'Ana Florence', label: 'Ana Florence', description: 'встроенный голос XTTS' },
     ];
     const m = el('div', 'ui-menu voice-menu');
     m.setAttribute('role', 'menu');
@@ -2210,7 +2215,12 @@
     if (e.target && e.target.closest && e.target.closest('input, textarea, select, [contenteditable="true"]')) closeMenu();
   }, true);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
-  window.addEventListener('scroll', closeMenu, true);
+  window.addEventListener('scroll', (e) => {
+    // Список голосов длинный и прокручивается внутри меню. Такой scroll доходит
+    // до window в фазе захвата — закрывать меню из-за него нельзя.
+    if (menuEl && e && e.target && menuEl.contains(e.target)) return;
+    closeMenu();
+  }, true);
   window.addEventListener('resize', closeMenu);
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', closeMenu);

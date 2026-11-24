@@ -1,4 +1,5 @@
-# Озвучка (локально, без torch). Ставится в .venv, которым запускается сервер:
+# Озвучка Piper (по умолчанию, без torch и FFmpeg). Ставится в .venv, которым запускается сервер:
 #   .venv\Scripts\python.exe -m pip install -r requirements-tts.txt
 # Для TTS_ENGINE=silero дополнительно нужен torch (см. docs/TTS.md).
+# Для TTS_ENGINE=xtts — requirements-tts-xtts.txt (coqui-tts + six, torch тот же).
 piper-tts>=1.2

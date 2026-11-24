@@ -9,8 +9,8 @@ import pytest
 
 from pulsenet import server
 from pulsenet.app import App
-from pulsenet.toolcalls import (MAX_STEPS, ToolCallFilter, parse_calls, parse_command,
-                                tool_result_block)
+from pulsenet.toolcalls import (MAX_STEPS, ToolCallFilter, find_bare_call, parse_calls,
+                                parse_command, strip_native_calls, tool_result_block)
 from pulsenet.tools import ChatTools, instructions
 from pulsenet.triplex import TriplexMemory
 from pulsenet.triplex.encoder import HashEncoder
@@ -39,6 +39,49 @@ def test_filter_unclosed_call_goes_to_calls():
     visible, raw = _feed_in_pieces('ок <tool_call>{"name": "web_fetch", "arguments": {"url": "https://a.b"}}', 4)
     assert visible == "ок "
     assert len(raw) == 1
+
+
+@pytest.mark.parametrize("size", [1, 3, 17, 200])
+def test_filter_parses_gemma4_native_call_for_any_chunking(size):
+    """LM Studio отдаёт нативный вызов Gemma 4 обычным текстом — он не должен утечь в ответ."""
+    text = ('Проверю. <|tool_call>call:web_search(queries=["новости ИИ", "AI today"])'
+            '<tool_call></tool_call> Готово.')
+    flt = ToolCallFilter(["web_search", "web_fetch"])
+    visible = []
+    for i in range(0, len(text), size):
+        visible.append(flt.feed(text[i:i + size]))
+    visible.append(flt.finish())
+    assert "".join(visible) == "Проверю.  Готово."
+    calls = parse_calls(flt.calls_raw)
+    assert len(calls) == 1 and not calls[0].get("error")
+    assert calls[0]["name"] == "web_search"
+    assert calls[0]["arguments"]["queries"] == ["новости ИИ", "AI today"]
+
+
+def test_native_call_without_close_token_is_parsed_at_finish():
+    text = '<|tool_call>call:image_generate(prompt="кот", steps=4)'
+    flt = ToolCallFilter(["image_generate"])
+    assert flt.feed(text) == ""
+    assert flt.finish() == ""
+    calls = parse_calls(flt.calls_raw)
+    assert len(calls) == 1 and not calls[0].get("error")
+    assert calls[0] == {"name": "image_generate", "arguments": {"prompt": "кот", "steps": 4}}
+
+
+def test_native_call_found_in_history_and_service_tokens_stripped():
+    text = '<|tool_call>call:web_fetch(url="https://example.org")<tool_call|>'
+    call = find_bare_call(text, ["web_fetch"])
+    assert call == {"name": "web_fetch", "arguments": {"url": "https://example.org"}}
+    assert strip_native_calls("Проверю " + text) == "Проверю "
+
+
+def test_empty_canonical_call_after_native_is_ignored():
+    text = ('<|tool_call>call:web_search(queries=["a"])'
+            '<tool_call></tool_call>')
+    flt = ToolCallFilter(["web_search"])
+    assert flt.feed(text) == ""
+    assert flt.finish() == ""
+    assert len(parse_calls(flt.calls_raw)) == 1
 
 
 def test_parse_calls_reports_errors_instead_of_raising():

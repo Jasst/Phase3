@@ -61,14 +61,21 @@ def detect_language(text: str, default: str = "ru") -> str:
 
 
 def make_tts(env: dict, data_dir: str):
-    """Движок озвучки по TTS_ENGINE: piper (по умолчанию, без torch) или silero (нужен torch)."""
+    """Движок озвучки по TTS_ENGINE: piper (по умолчанию), silero или xtts.
+
+    piper работает без torch; silero и xtts используют установленный torch (CPU достаточно).
+    Пакеты и настройки описаны в docs/TTS.md.
+    """
     engine = str(env.get("TTS_ENGINE") or "piper").strip().lower()
     if engine == "piper":
         from .tts_piper import PiperTTS
         return PiperTTS(env, data_dir)
     if engine == "silero":
         return SileroTTS(env, data_dir)
-    raise ValueError(f"неизвестный TTS_ENGINE={engine!r}: используйте piper или silero")
+    if engine in ("xtts", "coqui", "coqui-xtts"):
+        from .tts_xtts import XTTSTTS
+        return XTTSTTS(env, data_dir)
+    raise ValueError(f"неизвестный TTS_ENGINE={engine!r}: используйте piper, silero или xtts")
 
 
 def normalize_speaker(value=None, default=None) -> str:

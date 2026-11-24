@@ -7,6 +7,7 @@ import pytest
 
 from pulsenet.tts import SileroTTS, TTSError, detect_language, make_tts
 from pulsenet.tts_piper import PiperTTS, parse_voices
+from pulsenet.tts_xtts import XTTSTTS
 
 
 class _Chunk:
@@ -80,14 +81,15 @@ def test_first_voice_of_language_is_default(tmp_path):
 
 # ---------- выбор движка ----------
 
-def test_piper_is_default_and_silero_still_selectable(tmp_path):
+def test_piper_is_default_and_other_engines_are_selectable(tmp_path):
     assert isinstance(make_tts({}, str(tmp_path)), PiperTTS)
     assert isinstance(make_tts({"TTS_ENGINE": "silero"}, str(tmp_path)), SileroTTS)
+    assert isinstance(make_tts({"TTS_ENGINE": "xtts"}, str(tmp_path)), XTTSTTS)
 
 
-def test_xtts_is_removed_and_fails_clearly(tmp_path):
-    with pytest.raises(ValueError, match="piper или silero"):
-        make_tts({"TTS_ENGINE": "xtts"}, str(tmp_path))
+def test_unknown_engine_fails_clearly(tmp_path):
+    with pytest.raises(ValueError, match="piper, silero или xtts"):
+        make_tts({"TTS_ENGINE": "bogus"}, str(tmp_path))
 
 
 # ---------- доступ и статус ----------
