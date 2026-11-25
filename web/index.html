@@ -189,6 +189,11 @@
     </section>
 
     <section class="pane" id="pane-graph" role="tabpanel">
+      <form class="inline-form" id="graphThinkForm">
+        <input id="graphThinkQuery" placeholder="Вопрос к графу" autocomplete="off" aria-label="Вопрос для импульса">
+        <input id="graphThinkGoal" placeholder="Цель (направление мысли)" autocomplete="off" aria-label="Цель импульса">
+        <button class="btn-primary" type="submit">Пустить импульс</button>
+      </form>
       <div class="pane-bar">
         <button class="btn-ghost" id="graphReload" type="button">Обновить</button>
         <button class="btn-ghost" id="graphRelayout" type="button" title="Плавно переложить узлы заново">Разложить</button>

@@ -259,6 +259,27 @@ def test_confirm_caps_at_095_and_deny_halves(tmp_path):
     assert mem.confirm(f.fact_id, False)["confidence"] == pytest.approx(0.475)  # отказ ×0.5
 
 
+def test_think_endpoint_starts_impulse_and_feeds_graph(running):
+    app, port = running
+    text = "Маша любит кота. Кот лежит на коврике."
+    status, doc = _json(port, "POST", "/api/memory/ingest", {"text": text, "recorded_at": T0})
+    assert status == 200
+    source = {"doc_id": doc["doc_id"], "span": [0, 1]}
+    app.memory.assert_triple("Маша", "любит", "кот", source=source)
+    app.memory.assert_triple("кот", "лежит_на", "коврик", source=source)
+
+    status, thought = _json(port, "POST", "/api/memory/think",
+                            {"query": "Маша", "goal": "коврик", "steps": 2})
+    assert status == 200
+    assert thought["status"] == "ok"
+    assert "path" in thought and "activation" in thought
+    assert thought["path_length"] >= 1
+
+    _, graph = _json(port, "GET", "/api/memory/graph")
+    assert graph["thought"]["status"] == "ok"
+    assert any(e.get("activation", 0) > 0 for e in graph["edges"])
+
+
 def test_bad_json_and_unknown_fact_return_proper_codes(running):
     app, port = running
     status, body = _json(port, "POST", "/api/memory/retract", {"fact_id": "f:none"})

@@ -70,8 +70,9 @@ def _content_text(content) -> str:
 
 # Инструменты только для чтения: при сбое связи их можно повторить один раз.
 # Записи (triplex_ingest и т. п.) не повторяем, чтобы не создать дубль.
-READ_TOOLS = frozenset({"triplex_search", "triplex_facts", "triplex_graph", "triplex_stats",
-                        "activity_recent", "pulsenet_guide", "whoami", "web_search", "web_fetch"})
+READ_TOOLS = frozenset({"triplex_search", "triplex_think", "triplex_facts", "triplex_graph",
+                        "triplex_stats", "activity_recent", "pulsenet_guide", "whoami",
+                        "web_search", "web_fetch"})
 RETRY_DELAY = 0.7
 
 
@@ -181,6 +182,17 @@ class RemoteMemory:
         if as_of:
             args["as_of"] = as_of
         return self.client.call("triplex_search", args)
+
+    def think(self, query: str, goal: str = "", k: int = 8, steps: int = 3,
+              as_of: Optional[str] = None) -> dict:
+        args: Dict[str, Any] = {"query": query, "goal": goal, "k": int(k), "steps": int(steps)}
+        if as_of:
+            args["as_of"] = as_of
+        return self.client.call("triplex_think", args)
+
+    def feedback(self, fact_ids: List[str], valence: float) -> dict:
+        return self.client.call("triplex_feedback",
+                                {"fact_ids": list(fact_ids), "valence": float(valence)})
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",
                recorded_at: Optional[str] = None, model: str = "") -> dict:

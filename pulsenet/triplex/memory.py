@@ -25,6 +25,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
+from . import activation as activation_layer
 from .docstore import DocStore
 from .encoder import HashEncoder
 from .index import LSHIndex, VectorIndex, rrf
@@ -100,6 +101,7 @@ class TriplexMemory:
         self._load_meta()
         self._chunk_by_id: Dict[str, object] = {c.chunk_id: c for c in self.docs.all_chunks()}
         self._adj_cache: Optional[Tuple[int, Dict[str, List[Fact]]]] = None
+        self._last_thought: Optional[dict] = None   # Phase4: слепок последнего импульса (в памяти процесса)
         self._rebuild_indexes()
 
     # ---------- метаданные: сущности и отношения ----------
@@ -384,7 +386,8 @@ class TriplexMemory:
 
     def recall(self, query: str, as_of: Optional[str] = None, k_facts: int = 8, k_chunks: int = 4,
                coarse: int = 24, depth: int = 2, include_archived: bool = False,
-               budget_facts_chars: int = 3200, budget_chunks_chars: int = 1600) -> dict:
+               budget_facts_chars: int = 3200, budget_chunks_chars: int = 1600,
+               activate: bool = False, goal: str = "", steps: int = 3) -> dict:
         with self._lock:
             as_of = as_of or _now()
             t = _dt(as_of)
@@ -408,32 +411,47 @@ class TriplexMemory:
                                            set(_tokens(self._fact_text(by_id[fid]))), qtok)]
             chunk_rank = [k for k, _ in self.chunk_index.topk(qv, coarse)]
 
-            # Stage 2: expand (BFS по сущностям, путь = Π conf·decay)
-            adj = self._adjacency(live)
-            path_w: Dict[str, float] = {}
-            q: deque = deque()
-            seen_ent = set()
-            for fid in seeds:
-                f = by_id[fid]
-                for e in (f.s, f.o):
-                    if e not in seen_ent:
-                        seen_ent.add(e)
-                        q.append((e, 1.0, 0))
-            while q:
-                ent, w, d = q.popleft()
-                if d >= depth:
-                    continue
-                for f in adj.get(ent, []):
-                    other = f.o if f.s == ent else f.s
-                    if other == ent:
+            # Stage 2: expand. Phase4 — активационный поток вместо плоского BFS.
+            # Старый BFS остаётся за activate=False (регрессии и дешёвый путь).
+            thought: Optional[activation_layer.Thought] = None
+            if activate and seeds:
+                cue_text = " ".join(x for x in (query, goal or "") if x).strip()
+                cue_vec = self.encoder.embed_query([cue_text])[0]
+                thought = activation_layer.run(
+                    self, seeds, live, by_id, qv, cue_vec, t, query, goal=goal,
+                    steps=steps, top_k=max(coarse, k_facts * 2),
+                )
+                path_w = dict(thought.activation)
+                candidates = list(dict.fromkeys(
+                    seeds + thought.path + [fid for fid in path_w if fid not in seeds]
+                ))
+                self._last_thought = thought.to_dict(self)
+            else:
+                adj = self._adjacency(live)
+                path_w = {}
+                q: deque = deque()
+                seen_ent = set()
+                for fid in seeds:
+                    f = by_id[fid]
+                    for e in (f.s, f.o):
+                        if e not in seen_ent:
+                            seen_ent.add(e)
+                            q.append((e, 1.0, 0))
+                while q:
+                    ent, w, d = q.popleft()
+                    if d >= depth:
                         continue
-                    pw = w * f.confidence * self.decay_factor(f, t)
-                    if pw > path_w.get(f.fact_id, 0.0):
-                        path_w[f.fact_id] = pw
-                    if other not in seen_ent:
-                        seen_ent.add(other)
-                        q.append((other, pw, d + 1))
-            candidates = list(dict.fromkeys(seeds + [fid for fid in path_w if fid not in seeds]))
+                    for f in adj.get(ent, []):
+                        other = f.o if f.s == ent else f.s
+                        if other == ent:
+                            continue
+                        pw = w * f.confidence * self.decay_factor(f, t)
+                        if pw > path_w.get(f.fact_id, 0.0):
+                            path_w[f.fact_id] = pw
+                        if other not in seen_ent:
+                            seen_ent.add(other)
+                            q.append((other, pw, d + 1))
+                candidates = list(dict.fromkeys(seeds + [fid for fid in path_w if fid not in seeds]))
 
             # Stage 3: rerank (косинус + лексическое перекрытие; путь умножает expanded)
             qtok = set(_tokens(query))
@@ -500,7 +518,22 @@ class TriplexMemory:
                            "confidence": by_id[fid].confidence} for fid in top_facts],
                 "chunks": [{"chunk_id": cid, "text": chunk_by_id[cid].text} for cid in top_chunks],
                 "context": "\n".join(ctx_lines),
+                "thought": thought.to_dict(self) if thought is not None else None,
             }
+
+    # ---------- Phase4: мысль и валентность ----------
+
+    def think(self, query: str, goal: str = "", as_of: Optional[str] = None,
+              k: int = 8, steps: int = 3) -> dict:
+        """Запустить активационный поток и вернуть Thought (а не просто top-k фактов)."""
+        r = self.recall(query, as_of=as_of, k_facts=k, activate=True, goal=goal, steps=steps)
+        return r["thought"] or {"status": "empty", "query": query, "goal": goal,
+                                "steps": [], "path": [], "facts": [], "activation": {}}
+
+    def feedback(self, fact_ids: List[str], valence: float) -> dict:
+        """Обратное распространение оценки по пути мысли: valence ∈ [-1, 1]."""
+        updates = activation_layer.apply_valence(self, fact_ids or [], valence)
+        return {"status": "ok", "updates": [{"fact_id": fid, "amount": a} for fid, a in updates]}
 
     def _adjacency(self, live: List[Fact]) -> Dict[str, List[Fact]]:
         """Смежность сущностей для обхода. Пересобирается только при изменении состава фактов."""
@@ -616,19 +649,28 @@ class TriplexMemory:
                     ent = self.entities.get(key)
                     nodes[key] = {"id": key, "label": ent["canonical"] if ent else key,
                                   "type": ent["type"] if ent else None, "degree": 0,
-                                  "created": None, "linked": ent is not None}
+                                  "created": None, "linked": ent is not None, "activation": 0.0}
                 return nodes[key]
+
+            active_now = (self._last_thought or {}).get("activation", {})
+
+            def edge_strength(f: Fact) -> float:
+                # Собственный вес ребра без текущего запроса (кью-множитель = 1).
+                return round(activation_layer.edge_weight(self, f, t, 1.0), 3)
 
             edges = []
             for f in shown:
                 a, b = node(f.s), node(f.o)
+                imp = float(active_now.get(f.fact_id, 0.0))
                 for n in (a, b):
                     n["degree"] += 1
+                    n["activation"] = round(n.get("activation", 0.0) + imp, 3)
                     if n["created"] is None or f.recorded_at < n["created"]:
                         n["created"] = f.recorded_at
                 edges.append({"id": f.fact_id, "source": f.s, "target": f.o, "label": f.r,
                               "confidence": round(f.confidence, 3), "recorded_at": f.recorded_at,
-                              "access_count": f.access_count})
+                              "access_count": f.access_count, "boost": round(f.boost, 3),
+                              "weight": edge_strength(f), "activation": round(imp, 3)})
 
             per_day: Dict[str, int] = {}
             for f in active:
@@ -640,6 +682,17 @@ class TriplexMemory:
                 total += per_day[day]
                 growth.append({"day": day, "facts": total})
 
+            thought_meta = None
+            if self._last_thought:
+                thought_meta = {
+                    "status": self._last_thought.get("status"),
+                    "query": self._last_thought.get("query"),
+                    "goal": self._last_thought.get("goal"),
+                    "path_length": self._last_thought.get("path_length", 0),
+                    "path": [line["fact_id"] for line in self._last_thought.get("path", [])
+                             if line.get("fact_id")],
+                }
+
             return {
                 "as_of": now,
                 "nodes": list(nodes.values()),
@@ -648,4 +701,5 @@ class TriplexMemory:
                 "totals": {"entities": len(self.entities), "facts": len(active),
                            "alive": len(alive), "relations": len(self.relations)},
                 "growth": growth,
+                "thought": thought_meta,
             }

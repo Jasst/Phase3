@@ -67,6 +67,8 @@
     ingestText: $('ingestText'), ingestBtn: $('ingestBtn'), ingestOut: $('ingestOut'),
     graphReload: $('graphReload'), graphLive: $('graphLive'), graphStats: $('graphStats'),
     graphRelayout: $('graphRelayout'),
+    graphThinkForm: $('graphThinkForm'), graphThinkQuery: $('graphThinkQuery'),
+    graphThinkGoal: $('graphThinkGoal'),
     graphStage: $('graphStage'), graphCanvas: $('graphCanvas'), graphEmpty: $('graphEmpty'),
     graphZoomIn: $('graphZoomIn'), graphZoomOut: $('graphZoomOut'), graphZoomReset: $('graphZoomReset'),
     graphFullscreen: $('graphFullscreen'),
@@ -2424,6 +2426,7 @@
     nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
     hover: null, selected: null, selectedIds: new Set(), busy: false, typeColors: {}, relColors: {}, pulses: [],
     anim: [], nodeDrag: null, pointers: new Map(), pinch: null,
+    thought: null, pathIds: new Set(), pathNodeIds: new Set(),
     view: { scale: 1, ox: 0, oy: 0 }, drag: null, press: null, fullscreen: false,
     sessionStart: Date.now(),
   };
@@ -2548,6 +2551,15 @@
     graph.nodes = nodes;
     graph.edges = edges;
     graph.byId = byId;
+    graph.thought = data.thought || null;
+    graph.pathIds = new Set(((data.thought && data.thought.path) || []).filter(Boolean));
+    graph.pathNodeIds = new Set();
+    for (const e of edges) {
+      if (graph.pathIds.has(e.id || e.fact_id)) {
+        graph.pathNodeIds.add(e.a.id);
+        graph.pathNodeIds.add(e.b.id);
+      }
+    }
     if (changed) {
       graph.temp = hasNew ? Math.max(graph.temp, 1.2) : Math.max(graph.temp, 0.45);
       graph.frames = Math.min(graph.frames, LAYOUT_FRAMES - 120);
@@ -2571,8 +2583,12 @@
   function renderGraphMeta(data, nodes, edges) {
     const totals = data.totals || {};
     const fresh = nodes.filter((n) => n.isNew).length;
+    const active = edges.filter((e) => (e.activation || 0) > 0).length;
+    const pathLen = (data.thought && data.thought.path_length) || 0;
     els.graphStats.textContent = 'нейронов: ' + nodes.length + ' · связей: ' + edges.length +
       ' · всего фактов: ' + (totals.facts ?? 0) + ' · новых за сессию: ' + fresh +
+      (active ? ' · под током: ' + active : '') +
+      (pathLen ? ' · путь мысли: ' + pathLen : '') +
       (data.truncated ? ' · показаны свежие связи' : '');
     els.graphEmpty.hidden = nodes.length > 0;
 
@@ -2908,18 +2924,36 @@
     ctx.stroke();
 
     const focusedEdges = [];
+    const pathMode = graph.pathIds.size > 0;
     for (const e of graph.edges) {
       const focus = hi && (e.a === hi || e.b === hi);
+      const onPath = pathMode && graph.pathIds.has(e.id || e.fact_id);
+      const inactive = pathMode && !onPath && !focus && !hi;
       const pulse = graph.pulses.find((p) => p.edge === e);
-      const conf = Math.max(0, Math.min(1, e.confidence || 0.55));
+      const conf = Math.max(0, Math.min(1, e.weight ?? e.confidence ?? 0.55));
+      const imp = Math.max(0, Math.min(1, e.activation || 0));
       if (focus) focusedEdges.push(e);
       const c1 = edgeCurve(e);
+      ctx.filter = inactive ? 'blur(1.4px)' : 'none';
       ctx.strokeStyle = focus ? withAlpha(e.color || '#eceef1', 0.9)
-        : withAlpha(e.color || '#9aa3b2', hi ? 0.04 : 0.1 + 0.2 * conf);
-      ctx.lineWidth = (focus ? 2.1 : (0.7 + conf * 0.7)) * inv;
-      if (focus || pulse) {
+        : onPath ? withAlpha('#ffd36e', 1)
+        : inactive ? withAlpha(e.color || '#9aa3b2', 0.035)
+        : withAlpha(e.color || '#9aa3b2', 0.1 + 0.2 * conf + imp * 0.65);
+      ctx.lineWidth = (focus ? 2.4 : onPath ? 3.4 : inactive ? 0.5
+        : (0.7 + conf * 0.7 + imp * 1.5)) * inv;
+      if (onPath) {
+        ctx.save();
+        ctx.strokeStyle = withAlpha('#ffd36e', 0.22);
+        ctx.lineWidth = 10 * inv;
+        ctx.beginPath();
+        ctx.moveTo(e.a.x, e.a.y);
+        ctx.quadraticCurveTo(c1.cx, c1.cy, e.b.x, e.b.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+      if (focus || onPath || pulse || (!inactive && imp > 0.02)) {
         ctx.setLineDash([7 * inv, 8 * inv]);
-        ctx.lineDashOffset = -(now / 40) * inv;
+        ctx.lineDashOffset = -(now / (onPath ? 26 : 40)) * inv;
       } else {
         ctx.setLineDash([]);
       }
@@ -2929,6 +2963,7 @@
       ctx.stroke();
       e._curve = c1;
     }
+    ctx.filter = 'none';
     ctx.setLineDash([]);
 
     if (hi) {
@@ -2954,11 +2989,20 @@
     }
 
     for (const n of graph.nodes) {
+      const onPath = pathMode && graph.pathNodeIds.has(n.id);
       const related = hi && (n === hi || isNeighbor(n, hi) || selIds.has(n.id));
-      const dim = hi && !related;
-      const lifted = n === graph.hover || selIds.has(n.id) || (graph.nodeDrag && graph.nodeDrag.node === n);
-      drawNeuronShape(ctx, n, inv, { dim, lifted, related, phase });
+      const dim = (hi && !related) || (pathMode && !onPath && !hi);
+      const lifted = onPath || n === graph.hover || selIds.has(n.id) ||
+        (graph.nodeDrag && graph.nodeDrag.node === n);
+      drawNeuronShape(ctx, n, inv, { dim, lifted, related: related || onPath, phase });
 
+      if (onPath) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 8 * inv, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha('#ffd36e', 0.95);
+        ctx.lineWidth = 2.2 * inv;
+        ctx.stroke();
+      }
       if (n.isNew) {
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 3.5, 0, Math.PI * 2);
@@ -2993,6 +3037,11 @@
     const labels = [];
     const candidates = [...graph.nodes].sort((a, b) => b.degree - a.degree).slice(0, 18);
     for (const n of selectedNodes()) if (!candidates.includes(n)) candidates.unshift(n);
+    if (pathMode) {
+      for (const n of graph.nodes) {
+        if (graph.pathNodeIds.has(n.id) && !candidates.includes(n)) candidates.unshift(n);
+      }
+    }
     if (hi && !candidates.includes(hi)) candidates.unshift(hi);
     ctx.font = Math.round(12 * inv) + 'px system-ui, -apple-system, Segoe UI, sans-serif';
     ctx.textBaseline = 'middle';
@@ -3006,8 +3055,11 @@
       const hit = labels.some((b) => box.x < b.x + b.w + 6 * inv && box.x + box.w + 6 * inv > b.x && box.y < b.y + b.h + 4 * inv && box.y + box.h + 4 * inv > b.y);
       if (hit && n !== hi && !selIds.has(n.id)) continue;
       labels.push(box);
-      const dim = hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id));
-      ctx.fillStyle = dim ? 'rgba(236,238,241,0.32)' : 'rgba(236,238,241,0.95)';
+      const pathNode = pathMode && graph.pathNodeIds.has(n.id);
+      const dim = (hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id))) ||
+        (pathMode && !pathNode && !hi);
+      ctx.fillStyle = dim ? 'rgba(236,238,241,0.18)'
+        : pathNode ? '#ffd36e' : 'rgba(236,238,241,0.95)';
       ctx.fillText(text, x, y);
     }
   }
@@ -3106,7 +3158,9 @@
         const card = el('div', 'card');
         card.appendChild(el('div', 'fact-text', e.a.label + ' — ' + e.label + ' → ' + e.b.label));
         const when = e.created ? ' · ' + new Date(e.created).toLocaleString('ru-RU') : '';
-        card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence + when));
+        const impulse = (e.activation || 0) > 0 ? ' · импульс ' + e.activation : '';
+        card.appendChild(el('div', 'fact-meta', 'уверенность ' + e.confidence +
+          ' · вес ' + (e.weight ?? e.confidence) + impulse + when));
         const factId = e.id || e.fact_id;
         factActions(factId, card);
         attachMenu(card, (x, y) => showFactMenu(x, y, factId, e.a.label + ' — ' + e.label + ' → ' + e.b.label));
@@ -3182,6 +3236,28 @@
       els.graphStats.textContent = 'Ошибка: ' + (err.message || err);
     } finally {
       graph.busy = false;
+    }
+  }
+
+  async function runGraphThink() {
+    const query = (els.graphThinkQuery.value || '').trim();
+    const goal = (els.graphThinkGoal.value || '').trim();
+    if (!query) {
+      els.graphStats.textContent = 'Введите вопрос для импульса';
+      return;
+    }
+    const btn = els.graphThinkForm.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    els.graphStats.textContent = 'Пускаю импульс…';
+    try {
+      await api('POST', '/api/memory/think', {
+        query, goal, k: 8, steps: 3,
+      });
+      await loadGraph();   // граф сам покажет «путь мысли» и подсветит активные рёбра
+    } catch (err) {
+      els.graphStats.textContent = 'Ошибка импульса: ' + (err.message || err);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -3785,6 +3861,12 @@
   els.consolidateBtn.addEventListener('click', consolidate);
 
   els.graphReload.addEventListener('click', loadGraph);
+  if (els.graphThinkForm) {
+    els.graphThinkForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      runGraphThink();
+    });
+  }
   if (els.graphRelayout) els.graphRelayout.addEventListener('click', relayoutGraph);
   els.graphZoomIn.addEventListener('click', () => zoomAt(graph.W / 2, graph.H / 2, 1.2));
   els.graphZoomOut.addEventListener('click', () => zoomAt(graph.W / 2, graph.H / 2, 1 / 1.2));
