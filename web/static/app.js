@@ -66,6 +66,7 @@
     searchForm: $('searchForm'), searchQuery: $('searchQuery'), searchResults: $('searchResults'),
     ingestText: $('ingestText'), ingestBtn: $('ingestBtn'), ingestOut: $('ingestOut'),
     graphReload: $('graphReload'), graphLive: $('graphLive'), graphStats: $('graphStats'),
+    graphTrace: $('graphTrace'),
     graphRelayout: $('graphRelayout'),
     graphThinkForm: $('graphThinkForm'), graphThinkQuery: $('graphThinkQuery'),
     graphThinkGoal: $('graphThinkGoal'),
@@ -2580,6 +2581,44 @@
     kick();
   }
 
+  // Цепочка/топ импульсов — только из уже пришедших данных графа, без новых полей сервера.
+  function renderGraphTrace(data, edges) {
+    const box = els.graphTrace;
+    if (!box) return;
+    box.textContent = '';
+    const thought = data.thought || null;
+    const byFact = new Map();
+    for (const e of edges) byFact.set(e.id || e.fact_id, e);
+
+    const chain = [];
+    if (thought && thought.path && thought.path.length) {
+      for (const fid of thought.path) {
+        const e = byFact.get(fid);
+        if (e && !chain.includes(e)) chain.push(e);
+      }
+    }
+    if (!chain.length) {
+      chain.push(...edges.filter((e) => (e.activation || 0) > 0)
+        .sort((a, b) => (b.activation || 0) - (a.activation || 0)).slice(0, 6));
+    }
+    if (!chain.length) {
+      box.hidden = true;
+      return;
+    }
+
+    box.hidden = false;
+    box.appendChild(el('span', 'trace-title',
+      thought && thought.path && thought.path.length ? 'Цепочка мысли:' : 'Сильные импульсы:'));
+    chain.forEach((e, i) => {
+      const chip = el('span', 'trace-chip');
+      chip.appendChild(el('span', 'trace-idx', String(i + 1)));
+      chip.appendChild(el('span', 'trace-text',
+        e.a.label + ' —' + (e.label || 'связь') + '→ ' + e.b.label));
+      chip.appendChild(el('span', 'trace-val', Number(e.activation || 0).toFixed(3)));
+      box.appendChild(chip);
+    });
+  }
+
   function renderGraphMeta(data, nodes, edges) {
     const totals = data.totals || {};
     const fresh = nodes.filter((n) => n.isNew).length;
@@ -2590,6 +2629,7 @@
       (active ? ' · под током: ' + active : '') +
       (pathLen ? ' · путь мысли: ' + pathLen : '') +
       (data.truncated ? ' · показаны свежие связи' : '');
+    renderGraphTrace(data, edges);
     els.graphEmpty.hidden = nodes.length > 0;
 
     els.graphLegend.innerHTML = '';
@@ -2775,7 +2815,7 @@
     return 'rgba(' + ((v >> 16) & 255) + ',' + ((v >> 8) & 255) + ',' + (v & 255) + ',' + alpha + ')';
   }
 
-  function drawEdgeLabel(ctx, e, inv) {
+  function drawEdgeLabel(ctx, e, inv, accent) {
     const text = shorten(e.label || 'связь', 24);
     const mx = (e.a.x + e.b.x) / 2;
     const my = (e.a.y + e.b.y) / 2;
@@ -2787,7 +2827,7 @@
     const x = mx - w / 2;
     const y = my - h / 2;
     ctx.fillStyle = 'rgba(10, 13, 19, 0.82)';
-    ctx.strokeStyle = withAlpha(e.color || '#a6bfe0', 0.45);
+    ctx.strokeStyle = withAlpha(accent || e.color || '#a6bfe0', 0.55);
     ctx.lineWidth = 1 * inv;
     ctx.beginPath();
     if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
@@ -2924,23 +2964,27 @@
     ctx.stroke();
 
     const focusedEdges = [];
+    const activeLabelEdges = [];
     const pathMode = graph.pathIds.size > 0;
     for (const e of graph.edges) {
       const focus = hi && (e.a === hi || e.b === hi);
       const onPath = pathMode && graph.pathIds.has(e.id || e.fact_id);
-      const inactive = pathMode && !onPath && !focus && !hi;
+      const active = (e.activation || 0) > 0;
+      const inactive = pathMode && !onPath && !focus && !hi && !active;
       const pulse = graph.pulses.find((p) => p.edge === e);
       const conf = Math.max(0, Math.min(1, e.weight ?? e.confidence ?? 0.55));
       const imp = Math.max(0, Math.min(1, e.activation || 0));
       if (focus) focusedEdges.push(e);
+      if (active && !onPath && !inactive) activeLabelEdges.push(e);
       const c1 = edgeCurve(e);
       ctx.filter = inactive ? 'blur(1.4px)' : 'none';
       ctx.strokeStyle = focus ? withAlpha(e.color || '#eceef1', 0.9)
         : onPath ? withAlpha('#ffd36e', 1)
         : inactive ? withAlpha(e.color || '#9aa3b2', 0.035)
-        : withAlpha(e.color || '#9aa3b2', 0.1 + 0.2 * conf + imp * 0.65);
-      ctx.lineWidth = (focus ? 2.4 : onPath ? 3.4 : inactive ? 0.5
-        : (0.7 + conf * 0.7 + imp * 1.5)) * inv;
+        : active ? withAlpha(e.color || '#a6bfe0', 0.4 + 0.5 * imp)
+        : withAlpha(e.color || '#9aa3b2', 0.1 + 0.2 * conf);
+      ctx.lineWidth = (focus ? 2.4 : onPath ? 3.4 : active ? 1.6 + 1.2 * imp
+        : inactive ? 0.5 : (0.7 + conf * 0.7)) * inv;
       if (onPath) {
         ctx.save();
         ctx.strokeStyle = withAlpha('#ffd36e', 0.22);
@@ -2951,7 +2995,7 @@
         ctx.stroke();
         ctx.restore();
       }
-      if (focus || onPath || pulse || (!inactive && imp > 0.02)) {
+      if (focus || onPath || active || pulse) {
         ctx.setLineDash([7 * inv, 8 * inv]);
         ctx.lineDashOffset = -(now / (onPath ? 26 : 40)) * inv;
       } else {
@@ -2961,13 +3005,60 @@
       ctx.moveTo(e.a.x, e.a.y);
       ctx.quadraticCurveTo(c1.cx, c1.cy, e.b.x, e.b.y);
       ctx.stroke();
+
+      // Направление: стрелка у целевого узла. Без неё связь читается как «просто линия».
+      if ((active || focus) && !inactive) {
+        const len = Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y) || 1;
+        const back = Math.min((e.b.r || 12) + 7 * inv, len * 0.32);
+        const t = Math.max(0.55, 1 - back / len);
+        const mt = 1 - t;
+        const px = mt * mt * e.a.x + 2 * mt * t * c1.cx + t * t * e.b.x;
+        const py = mt * mt * e.a.y + 2 * mt * t * c1.cy + t * t * e.b.y;
+        const dx = 2 * mt * (c1.cx - e.a.x) + 2 * t * (e.b.x - c1.cx);
+        const dy = 2 * mt * (c1.cy - e.a.y) + 2 * t * (e.b.y - c1.cy);
+        const ang = Math.atan2(dy, dx);
+        const s = (onPath ? 9 : 6.5) * inv;
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.rotate(ang);
+        ctx.fillStyle = onPath ? withAlpha('#ffd36e', 1)
+          : focus ? withAlpha(e.color || '#eceef1', 0.95)
+          : withAlpha(e.color || '#a6bfe0', 0.75 + 0.25 * imp);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(-s, s * 0.5);
+        ctx.lineTo(-s * 0.65, 0);
+        ctx.lineTo(-s, -s * 0.5);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
       e._curve = c1;
     }
     ctx.filter = 'none';
     ctx.setLineDash([]);
 
+    // Подписи отношений: при наведении + у активных рёбер + у всего пути мысли.
+    const labeled = new Set();
     if (hi) {
-      for (const e of focusedEdges.slice(0, 18)) drawEdgeLabel(ctx, e, inv);
+      for (const e of focusedEdges.slice(0, 18)) {
+        drawEdgeLabel(ctx, e, inv);
+        labeled.add(e);
+      }
+    }
+    activeLabelEdges.sort((a, b) => (b.activation || 0) - (a.activation || 0));
+    for (const e of activeLabelEdges.slice(0, 10)) {
+      if (labeled.has(e)) continue;
+      drawEdgeLabel(ctx, e, inv);
+      labeled.add(e);
+    }
+    if (pathMode) {
+      for (const e of graph.edges) {
+        if (graph.pathIds.has(e.id || e.fact_id) && !labeled.has(e)) {
+          drawEdgeLabel(ctx, e, inv, '#ffd36e');
+          labeled.add(e);
+        }
+      }
     }
 
     graph.pulses = graph.pulses.filter((p) => p.until > now);
@@ -2990,17 +3081,24 @@
 
     for (const n of graph.nodes) {
       const onPath = pathMode && graph.pathNodeIds.has(n.id);
+      const activeNode = (n.activation || 0) > 0;
       const related = hi && (n === hi || isNeighbor(n, hi) || selIds.has(n.id));
-      const dim = (hi && !related) || (pathMode && !onPath && !hi);
-      const lifted = onPath || n === graph.hover || selIds.has(n.id) ||
+      const dim = (hi && !related && !activeNode) || (pathMode && !onPath && !hi && !activeNode);
+      const lifted = onPath || activeNode || n === graph.hover || selIds.has(n.id) ||
         (graph.nodeDrag && graph.nodeDrag.node === n);
-      drawNeuronShape(ctx, n, inv, { dim, lifted, related: related || onPath, phase });
+      drawNeuronShape(ctx, n, inv, { dim, lifted, related: related || onPath || activeNode, phase });
 
       if (onPath) {
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 8 * inv, 0, Math.PI * 2);
         ctx.strokeStyle = withAlpha('#ffd36e', 0.95);
         ctx.lineWidth = 2.2 * inv;
+        ctx.stroke();
+      } else if (activeNode) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 4.5 * inv, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(n.color || '#a6bfe0', 0.6);
+        ctx.lineWidth = 1.4 * inv;
         ctx.stroke();
       }
       if (n.isNew) {
