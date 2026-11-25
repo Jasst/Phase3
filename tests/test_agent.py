@@ -179,6 +179,19 @@ def test_memory_search_formats_facts_for_model():
     assert out.ok and "Нел — разработчик" in out.text and "Факты:" in out.text
 
 
+def test_memory_search_gives_thought_path_to_model():
+    t = _tools(recall=lambda q, k: {"status": "ok", "facts": [], "chunks": [],
+        "thought": {"status": "ok", "goal": "коврик", "path_length": 1, "path": [{
+            "text": "кот лежит на коврике", "relation": "лежит_на",
+            "activation": 0.33, "source": {"doc_id": "d:7c1c"}}]}})
+    out = t.run("memory_search", {"query": "кот"})
+    assert out.ok
+    assert "Путь мысли к цели «коврик»" in out.text
+    assert "кот лежит на коврике" in out.text
+    assert "активация 0.33" in out.text
+    assert "d:7c1c" in out.text
+
+
 # ---------- агентный цикл в App ----------
 
 class ScriptedBackend:

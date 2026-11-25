@@ -21,6 +21,7 @@ import math
 import os
 import re
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
@@ -35,6 +36,8 @@ LINK_HI = 0.85       # A2: cos ≥ 0.85 → link
 LINK_LO = 0.70       # A2: 0.70 ≤ cos < 0.85 → link с conf×0.7
 REL_COS = 0.80       # A3: cos ≥ 0.80 → map
 CONF_PRIOR = 0.8     # калибровка: conf = llm_report × 0.8
+THOUGHT_HALF_LIFE_SEC = 15.0   # Phase4: полураспад следа мысли в графе
+THOUGHT_CLEAR_BELOW = 0.02     # полная очистка, когда активация угасла
 ARCHIVE_THETA = 0.1  # decay: архив при salience < 0.1
 DAY = 86400.0
 
@@ -102,6 +105,7 @@ class TriplexMemory:
         self._chunk_by_id: Dict[str, object] = {c.chunk_id: c for c in self.docs.all_chunks()}
         self._adj_cache: Optional[Tuple[int, Dict[str, List[Fact]]]] = None
         self._last_thought: Optional[dict] = None   # Phase4: слепок последнего импульса (в памяти процесса)
+        self._last_thought_at: Optional[float] = None  # время импульса для затухания следа
         self._rebuild_indexes()
 
     # ---------- метаданные: сущности и отношения ----------
@@ -426,6 +430,7 @@ class TriplexMemory:
                     seeds + thought.path + [fid for fid in path_w if fid not in seeds]
                 ))
                 self._last_thought = thought.to_dict(self)
+                self._last_thought_at = time.monotonic()
             else:
                 adj = self._adjacency(live)
                 path_w = {}
@@ -627,6 +632,27 @@ class TriplexMemory:
                 "extractor": self.extractor is not None,
             }
 
+    def _live_thought(self) -> Tuple[Optional[dict], Dict[str, float]]:
+        """След мысли с учётом полураспада. Возвращает (мета, угасшая_активация).
+
+        Мысль — не постоянное состояние графа: она живёт в памяти процесса и
+        должна угасать, иначе подсветка в интерфейсе «залипает». Затухание
+        считается от времени последнего импульса и не пишется в журнал.
+        """
+        if not self._last_thought:
+            return None, {}
+        elapsed = max(0.0, time.monotonic() - (self._last_thought_at or 0.0))
+        factor = 0.5 ** (elapsed / THOUGHT_HALF_LIFE_SEC)
+        act = {fid: round(float(a) * factor, 4)
+               for fid, a in (self._last_thought.get("activation") or {}).items()}
+        if not act or max(act.values()) < THOUGHT_CLEAR_BELOW:
+            self._last_thought = None
+            self._last_thought_at = None
+            return None, {}
+        meta = dict(self._last_thought)
+        meta["activation"] = act
+        return meta, act
+
     def graph(self, max_edges: int = 400) -> dict:
         """Срез памяти для визуализации: сущности — узлы («нейроны»), действующие факты — связи.
 
@@ -652,7 +678,7 @@ class TriplexMemory:
                                   "created": None, "linked": ent is not None, "activation": 0.0}
                 return nodes[key]
 
-            active_now = (self._last_thought or {}).get("activation", {})
+            thought, active_now = self._live_thought()
 
             def edge_strength(f: Fact) -> float:
                 # Собственный вес ребра без текущего запроса (кью-множитель = 1).
@@ -683,13 +709,13 @@ class TriplexMemory:
                 growth.append({"day": day, "facts": total})
 
             thought_meta = None
-            if self._last_thought:
+            if thought:
                 thought_meta = {
-                    "status": self._last_thought.get("status"),
-                    "query": self._last_thought.get("query"),
-                    "goal": self._last_thought.get("goal"),
-                    "path_length": self._last_thought.get("path_length", 0),
-                    "path": [line["fact_id"] for line in self._last_thought.get("path", [])
+                    "status": thought.get("status"),
+                    "query": thought.get("query"),
+                    "goal": thought.get("goal"),
+                    "path_length": thought.get("path_length", 0),
+                    "path": [line["fact_id"] for line in thought.get("path", [])
                              if line.get("fact_id")],
                 }
 

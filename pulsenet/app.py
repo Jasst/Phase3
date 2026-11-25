@@ -700,7 +700,7 @@ class App:
                 "источники указаны):\n" + ctx)
 
     def _tool_recall(self, query: str, k: int) -> dict:
-        return self.memory.recall(query, k_facts=k)
+        return self.memory.recall(query, k_facts=k, activate=True)
 
     def _tool_remember(self, text: str, chat_id: str) -> dict:
         if not self.memory_enabled:

@@ -177,8 +177,10 @@ class RemoteMemory:
         self.client = client
 
     def recall(self, query: str, as_of: Optional[str] = None, k_facts: int = 8,
-               include_archived: bool = False) -> dict:
-        args: Dict[str, Any] = {"query": query, "k": int(k_facts), "include_archived": bool(include_archived)}
+               include_archived: bool = False, activate: bool = True) -> dict:
+        args: Dict[str, Any] = {"query": query, "k": int(k_facts),
+                                "include_archived": bool(include_archived),
+                                "activate": bool(activate)}
         if as_of:
             args["as_of"] = as_of
         return self.client.call("triplex_search", args)

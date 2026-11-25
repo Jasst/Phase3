@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """Phase4: активационный поток, мысль и обратное кредитование пути."""
+import pytest
+
 from pulsenet.triplex import HashEncoder, TriplexMemory
 from pulsenet.triplex.journal import FactJournal
+from pulsenet.triplex.memory import THOUGHT_HALF_LIFE_SEC
 
 
 def _memory(tmp_path):
@@ -73,6 +76,29 @@ def test_graph_exposes_weight_boost_and_last_impulse(tmp_path):
     assert g["thought"]["status"] == "ok"
     assert g["thought"]["path"]                      # путь отдан интерфейсу для подсветки
     assert any(e["activation"] > 0 for e in g["edges"])
+
+
+def test_thought_activation_decays_and_then_clears(tmp_path, monkeypatch):
+    mem, _, _ = _memory(tmp_path)
+    clock = [1000.0]
+    monkeypatch.setattr("pulsenet.triplex.memory.time.monotonic", lambda: clock[0])
+    mem.think("Маша", goal="коврик", steps=2)
+
+    def peak():
+        return max([e["activation"] for e in mem.graph(50)["edges"]] or [0.0])
+
+    a0 = peak()
+    assert a0 > 0
+
+    clock[0] += THOUGHT_HALF_LIFE_SEC
+    a1 = peak()
+    assert 0 < a1 < a0
+    assert a1 == pytest.approx(a0 / 2, rel=0.15)
+
+    clock[0] += 120
+    g = mem.graph(50)
+    assert g["thought"] is None
+    assert all(e["activation"] == 0 for e in g["edges"])
 
 
 def test_journal_rejects_boost_out_of_range():
