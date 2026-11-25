@@ -15,6 +15,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -22,6 +23,8 @@ import sqlite3
 import threading
 import time
 from typing import Optional
+
+log = logging.getLogger("pulsenet.mcp.auth")
 
 _UID_RE = re.compile(r"[A-Za-z0-9_.@-]{1,64}")
 
@@ -76,6 +79,11 @@ class TokenStore:
                     pass
             except OSError:
                 pass
+        # Ключ рядом с базой: утечка папки раскрывает и токены. Ключ лучше задать в MCP_TOKEN_SECRET.
+        if not (secret or "").strip() and os.path.dirname(os.path.abspath(self._key_path)) == \
+                os.path.dirname(os.path.abspath(path)):
+            log.warning("шифровальный ключ токенов лежит рядом с tokens.sqlite; задайте MCP_TOKEN_SECRET "
+                        "в .env, чтобы хранить ключ отдельно от базы")
         self._fernet = None
         if Fernet is not None and raw_secret:
             key = base64.urlsafe_b64encode(hashlib.sha256(raw_secret.encode("utf-8")).digest())

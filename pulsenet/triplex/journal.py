@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -63,6 +63,7 @@ class Fact:
     access_count: int = 0          # I10: счётчик обращений (только top-8 при retrieve)
     last_accessed: Optional[str] = None
     salience: float = 0.8          # salience_0 для decay (A5), по умолчанию = confidence
+    corroborations: list = field(default_factory=list)  # подтверждения из других документов (provenance)
 
     def end(self) -> Optional[datetime]:
         """Момент прекращения действия: min(valid_to, invalid_at); None — открыт."""
@@ -97,6 +98,7 @@ class FactJournal:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.facts: Dict[str, Fact] = {}
         self._by_sr: Dict[Tuple[str, str], Set[str]] = {}
+        self.generation = 0            # растёт при изменении состава фактов; кэши графа сверяются с ним
         if path and os.path.exists(path):
             self._replay_file()
 
@@ -105,13 +107,16 @@ class FactJournal:
 
     # ---------- журнал ----------
 
-    def _append(self, rec: dict) -> None:
+    def _append(self, rec: dict, durable: bool = True) -> None:
         if self.path:
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
                 f.flush()
-                os.fsync(f.fileno())
+                if durable:
+                    os.fsync(f.fileno())
         self._apply(rec)
+        if rec["op"] not in ("access", "adjust"):   # кэши графа зависят от состава фактов, не от счётчиков
+            self.generation += 1
 
     def _replay_file(self) -> None:
         with open(self.path, encoding="utf-8") as f:
@@ -144,6 +149,11 @@ class FactJournal:
         elif op == "adjust":                      # I9: confirm/deny меняют только confidence
             f = self.facts[rec["fact_id"]]
             f.confidence = rec["confidence"]
+        elif op == "corroborate":                 # повторное подтверждение из другого источника
+            f = self.facts.get(rec["fact_id"])
+            if f is not None:
+                f.corroborations.append(rec["source"])
+                f.confidence = rec["confidence"]
         elif op == "access":
             for fid in rec["fact_ids"]:
                 f = self.facts.get(fid)
@@ -199,6 +209,10 @@ class FactJournal:
         fid = _fact_id(s, r, o, vf, source)
         if fid in self.facts:  # I7
             return self.facts[fid]
+        if not functional:
+            live = self.live_triple(s, r, o)
+            if live is not None:       # то же утверждение из другого документа: подтверждение, а не копия
+                return self.corroborate(live.fact_id, source=source, confidence=confidence)
         status, old = self.conflict_check(s, r, o, vf, functional)
         if status == "CONFLICT":
             raise ConflictError(f"{s} {r}: уже действует {old.o!r}", old.fact_id)
@@ -216,6 +230,31 @@ class FactJournal:
         else:
             self._append({"op": "assert", "fact": rec_fact})
         return self.facts[fid]
+
+    def live_triple(self, s: str, r: str, o: str, as_of: Optional[str] = None) -> Optional[Fact]:
+        """Действующий факт с тем же (s, r, o), если он есть (для дедупликации)."""
+        t = _dt(as_of or now_iso())
+        for fid in self._by_sr.get((s, r), ()):
+            f = self.facts[fid]
+            if f.o != o or f.retracted:
+                continue
+            if f.invalid_at is not None or _dt(f.valid_from) > t:
+                continue
+            end = f.end()
+            if end is not None and t >= end:
+                continue
+            return f
+        return None
+
+    def corroborate(self, fact_id: str, *, source: dict, confidence: float = 0.8) -> Fact:
+        """Подтвердить существующий факт источником. Уверенность растёт до 0.95, копия не создаётся."""
+        _check_source(source)
+        f = self.facts[fact_id]
+        new_conf = round(min(0.95, max(f.confidence, confidence) + 0.05), 4)
+        if source in f.corroborations or source == f.source:
+            return f                    # тот же источник повторно: ничего не меняем
+        self._append({"op": "corroborate", "fact_id": fact_id, "source": source, "confidence": new_conf})
+        return f
 
     def retract(self, fact_id: str, at: Optional[str] = None) -> Fact:
         f = self.facts[fact_id]  # KeyError, если факта нет
@@ -256,7 +295,8 @@ class FactJournal:
         """Учесть обращение к фактам (I10). Вызывать только для фактов, попавших в итоговый top-k."""
         ids = [i for i in fact_ids if i in self.facts]
         if ids:
-            self._append({"op": "access", "fact_ids": ids, "at": at or now_iso()})
+            # без fsync: потеря последнего счётчика обращений при сбое допустима, запись на каждом поиске — нет
+            self._append({"op": "access", "fact_ids": ids, "at": at or now_iso()}, durable=False)
 
     def query(self, s=None, r=None, o=None, as_of: Optional[str] = None) -> List[Fact]:
         """Действующие факты на момент as_of (ось valid-time). Retract-нутые не возвращаются."""
@@ -292,6 +332,11 @@ class FactJournal:
                 bad.append(f"{f.fact_id}: I2 invalid_at < valid_from")
             if f.retracted and f.invalid_at is None:
                 bad.append(f"{f.fact_id}: I3 retracted без invalid_at")
+            for src in f.corroborations:
+                try:
+                    _check_source(src)
+                except InvariantError as exc:
+                    bad.append(f"{f.fact_id}: I1 подтверждение без источника: {exc}")
             if f.access_count > 0 and f.last_accessed is None:
                 bad.append(f"{f.fact_id}: I10 access_count>0 без last_accessed")
             if f.supersedes is not None:

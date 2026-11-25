@@ -48,20 +48,32 @@ class LSHIndex:
 
 
 class VectorIndex:
+    """Точный косинус. Векторы лежат в буфере с ростом вдвое: добавление амортизированно O(1),
+    а не O(N) как при пересоздании матрицы на каждый вектор (раньше 8k векторов — 10 с)."""
+
     def __init__(self, dim: int):
         self.dim = dim
         self.keys: List[Hashable] = []
         self.pos: Dict[Hashable, int] = {}
-        self.mat = np.zeros((0, dim), dtype=np.float32)
+        self._buf = np.zeros((0, dim), dtype=np.float32)
+
+    @property
+    def mat(self) -> np.ndarray:
+        return self._buf[:len(self.keys)]
 
     def add(self, key: Hashable, vec: np.ndarray) -> None:
-        v = vec.astype(np.float32).reshape(1, -1)
+        v = vec.astype(np.float32).reshape(-1)
         if key in self.pos:
-            self.mat[self.pos[key]] = v[0]
+            self._buf[self.pos[key]] = v
             return
-        self.pos[key] = len(self.keys)
+        n = len(self.keys)
+        if n >= self._buf.shape[0]:
+            grown = np.zeros((max(16, 2 * self._buf.shape[0]), self.dim), dtype=np.float32)
+            grown[:n] = self._buf[:n]
+            self._buf = grown
+        self._buf[n] = v
+        self.pos[key] = n
         self.keys.append(key)
-        self.mat = np.vstack([self.mat, v]) if len(self.keys) > 1 else v.copy()
 
     def __len__(self) -> int:
         return len(self.keys)

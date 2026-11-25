@@ -223,13 +223,16 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         if e:
             return e
         try:
-            f = mem.journal.assert_fact(s, r, o, source={"doc_id": doc_id, "span": span, "agent": uid},
+            # тот же путь, что у ingest: сущности, отношения, конфликты, индекс поиска, дедупликация
+            with mem._lock:
+                out = mem.assert_triple(s, r, o, source={"doc_id": doc_id, "span": span, "agent": uid},
                                         confidence=confidence, functional=functional)
-        except ConflictError as exc:
-            return {"status": "conflict", "message": str(exc), "old_fact_id": exc.old_fact_id}
-        except (InvariantError, ValueError) as exc:
+        except (InvariantError, ValueError, KeyError) as exc:
             return _err(str(exc))
-        return {"status": "ok", "fact": fact_to_dict(f)}
+        if out["status"] != "ok":
+            return out
+        return {"status": "ok", "fact": fact_to_dict(mem.journal.facts[out["fact_id"]]),
+                "text": out["text"], "relation": out["relation"], "relation_status": out["relation_status"]}
 
     @mcp.tool()
     @audit("triplex_supersede", lambda k: f"{k.get('s')} {k.get('r')} {k.get('o')}")

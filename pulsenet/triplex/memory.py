@@ -98,6 +98,8 @@ class TriplexMemory:
         self.rel_index = VectorIndex(self.dim)
 
         self._load_meta()
+        self._chunk_by_id: Dict[str, object] = {c.chunk_id: c for c in self.docs.all_chunks()}
+        self._adj_cache: Optional[Tuple[int, Dict[str, List[Fact]]]] = None
         self._rebuild_indexes()
 
     # ---------- метаданные: сущности и отношения ----------
@@ -296,6 +298,8 @@ class TriplexMemory:
         Без него используется экстрактор памяти по умолчанию."""
         with self._lock:
             doc = self.docs.add(text, session_id=session_id, role=role, recorded_at=recorded_at, agent=agent)
+            for c in doc.chunks:
+                self._chunk_by_id[c.chunk_id] = c
             if doc.chunks and not all(c.chunk_id in self.chunk_index.pos for c in doc.chunks):
                 vecs = self.encoder.embed([c.text for c in doc.chunks])
                 for c, v in zip(doc.chunks, vecs):
@@ -405,10 +409,7 @@ class TriplexMemory:
             chunk_rank = [k for k, _ in self.chunk_index.topk(qv, coarse)]
 
             # Stage 2: expand (BFS по сущностям, путь = Π conf·decay)
-            adj: Dict[str, List[Fact]] = {}
-            for f in live:
-                adj.setdefault(f.s, []).append(f)
-                adj.setdefault(f.o, []).append(f)
+            adj = self._adjacency(live)
             path_w: Dict[str, float] = {}
             q: deque = deque()
             seen_ent = set()
@@ -458,7 +459,7 @@ class TriplexMemory:
                     chunk_ids.append(c.chunk_id)
             chunk_scores = []
             qtok_all = set(_tokens(query))
-            chunk_by_id = {c.chunk_id: c for doc in self.docs.docs.values() for c in doc.chunks}
+            chunk_by_id = self._chunk_by_id
             for cid in chunk_ids:
                 if cid in self.chunk_index.pos:
                     cs = float(self.chunk_index.mat[self.chunk_index.pos[cid]] @ qv)
@@ -500,6 +501,49 @@ class TriplexMemory:
                 "chunks": [{"chunk_id": cid, "text": chunk_by_id[cid].text} for cid in top_chunks],
                 "context": "\n".join(ctx_lines),
             }
+
+    def _adjacency(self, live: List[Fact]) -> Dict[str, List[Fact]]:
+        """Смежность сущностей для обхода. Пересобирается только при изменении состава фактов."""
+        gen = self.journal.generation
+        if self._adj_cache is not None and self._adj_cache[0] == gen:
+            return self._adj_cache[1]
+        adj: Dict[str, List[Fact]] = {}
+        for f in live:
+            adj.setdefault(f.s, []).append(f)
+            adj.setdefault(f.o, []).append(f)
+        self._adj_cache = (gen, adj)
+        return adj
+
+    def assert_triple(self, s_name: str, r: str, o_name: str, *, source: dict, confidence: float = 0.8,
+                      functional: bool = False, valid_from: Optional[str] = None) -> dict:
+        """Единая точка прямой записи факта (MCP triplex_assert). Тот же путь, что и у ingest:
+        связывание сущностей (A2), нормализация отношения (A3), конфликты functional (A1),
+        индекс факта. Раньше инструмент писал в журнал напрямую: сущности не связывались,
+        факт не попадал в поиск до перезапуска, дубли не отсекались."""
+        with self._lock:
+            s_act, s_id, s_cf, s_c = self.link_entity(s_name)
+            o_act, o_id, o_cf, o_c = self.link_entity(o_name)
+            if "ask" in (s_act, o_act):
+                return {"status": "ambiguous", "message": "несколько похожих сущностей: уточните, какую имеете в виду",
+                        "candidates": s_c or o_c}
+            s_id = s_id or self._create_entity(s_name, "other")
+            o_id = o_id or self._create_entity(o_name, "other")
+            rel, how = self.normalize_relation(r)
+            functional = self.relations[rel]["functional"] or functional
+            conf = confidence * min(s_cf, o_cf)
+            if valid_from is None and source.get("doc_id") in self.docs.docs:
+                valid_from = self.docs.docs[source["doc_id"]].recorded_at
+            try:
+                fact = self.journal.assert_fact(s_id, rel, o_id, source=source, valid_from=valid_from,
+                                                confidence=conf, functional=functional)
+            except ConflictError as exc:
+                return {"status": "conflict", "message": str(exc), "old_fact_id": exc.old_fact_id}
+            if fact.fact_id not in self.fact_index.pos:
+                v = self.encoder.embed([self._fact_text(fact)])[0]
+                self.fact_index.add(fact.fact_id, v)
+                self.fact_lsh.add(fact.fact_id, v)
+            return {"status": "ok", "fact_id": fact.fact_id, "text": self._fact_text(fact),
+                    "confidence": round(fact.confidence, 4), "relation": rel, "relation_status": how}
 
     def _relevant(self, cos: float, text_tokens: set, query_tokens: set) -> bool:
         """Релевантность: семантически близко (cos ≥ порога) ИЛИ половина слов запроса есть в тексте."""

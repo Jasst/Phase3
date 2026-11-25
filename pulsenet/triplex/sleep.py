@@ -54,18 +54,64 @@ def is_eligible(f, memory, now: datetime) -> bool:
     return now - _dt(f.valid_from) >= AGE_MIN
 
 
+LOG_NAME = "sleep_log.jsonl"          # журнал принятых консолидаций (вне журнала фактов)
+HOLDOUT_SIZE = 20                     # старые факты, которых нет в обучении: по ним решает гейт
+
+
+def consolidated_ids(memory) -> set:
+    """Факты, уже закреплённые в весах принятым адаптером. Повторно в обучение не берём."""
+    path = os.path.join(memory.root, LOG_NAME)
+    if not os.path.exists(path):
+        return set()
+    out = set()
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                out.update(json.loads(line).get("fact_ids", []))
+    return out
+
+
+def record_consolidation(memory, fact_ids, adapter_dir: str, gate: dict) -> bool:
+    """Записать консолидацию, только если гейт принял адаптер. Отклонённый адаптер ничего не меняет."""
+    if not gate.get("accept"):
+        return False
+    rec = {"at": _now().isoformat(), "adapter": adapter_dir, "fact_ids": sorted(fact_ids), "gate": gate}
+    with open(os.path.join(memory.root, LOG_NAME), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return True
+
+
 def plan_consolidation(memory, now: Optional[datetime] = None) -> dict:
-    """Собрать датасет для «Сна». Не обучает модель, только отбирает данные."""
+    """Собрать датасет для «Сна». Не обучает модель, только отбирает данные.
+
+    Разделение по фактам (без пересечений):
+      eligible   — новые семантические факты, уходят в обучение (ответы на них — цель);
+      rehearsal  — старые, не закреплённые ранее, повторяются в обучении (40% датасета);
+      gate_rows  — отложенная выборка старых фактов, которых НЕТ в обучении: по ней гейт
+                   измеряет забывание. Без неё гейт проверял бы запоминание обучающих данных.
+    Уже закреплённые факты (sleep_log.jsonl) в обучение не попадают повторно.
+    """
     now = now or _now()
+    done = consolidated_ids(memory)
     active = [f for f in memory.journal.facts.values() if not f.retracted and f.invalid_at is None]
-    eligible = sorted((f for f in active if is_eligible(f, memory, now)), key=lambda f: f.fact_id)
+    eligible = sorted((f for f in active if f.fact_id not in done and is_eligible(f, memory, now)),
+                      key=lambda f: f.fact_id)
     eligible_ids = {f.fact_id for f in eligible}
-    rehearsal_pool = sorted((f for f in active if f.fact_id not in eligible_ids), key=lambda f: f.fact_id)
+    pool = sorted((f for f in active if f.fact_id not in eligible_ids and f.fact_id not in done),
+                  key=lambda f: f.fact_id)
+    rng_gate = random.Random(SEED + 1)
+    gate_facts = rng_gate.sample(pool, min(HOLDOUT_SIZE, len(pool))) if pool else []
+    gate_ids = {f.fact_id for f in gate_facts}
+    rehearsal_pool = [f for f in pool if f.fact_id not in gate_ids]
     rng = random.Random(SEED)
     k = min(len(rehearsal_pool), int(len(eligible) * REHEARSAL_RATIO / (1 - REHEARSAL_RATIO))) if eligible else 0
     rehearsal = rng.sample(rehearsal_pool, k) if k else []
     rows = [_qa(memory, f, "new") for f in eligible] + [_qa(memory, f, "rehearsal") for f in rehearsal]
     return {"eligible": len(eligible), "rehearsal": len(rehearsal), "rows": rows,
+            "eligible_ids": sorted(eligible_ids),
+            "gate_rows": [_qa(memory, f, "gate_old") for f in gate_facts],
             "status": "dataset_ready" if rows else "nothing_eligible"}
 
 
@@ -84,7 +130,11 @@ def write_dataset(rows: List[dict], path: str) -> str:
 
 
 def accept_adapter(old_before: float, old_after: float, ppl_before: float, ppl_after: float) -> Dict[str, object]:
-    """Гейт G7: принять адаптер только если забывание ≤1% и общая перплексия выросла не больше чем на 1%."""
+    """Гейт G7: принять адаптер только если забывание ≤1% и общая перплексия выросла не больше чем на 1%.
+
+    old_before/old_after — точность ответов на gate_rows (доля 0..1), измеренная ДО и ПОСЛЕ обучения.
+    ppl_before/ppl_after — перплексия на общей выборке. Измерять должен вызывающий код (см. measure_gate).
+    """
     forgetting = old_before - old_after
     ppl_rise = (ppl_after - ppl_before) / ppl_before if ppl_before > 0 else float("inf")
     ok_old = old_after >= old_before - GATE_OLD_FACT_DROP
@@ -117,7 +167,8 @@ def train(dataset_path: str, base_dir: str, out_dir: str, steps: int = 200) -> s
     cfg = LoraConfig(r=LORA["r"], lora_alpha=LORA["alpha"], lora_dropout=0.0, task_type="CAUSAL_LM")
     model = get_peft_model(model, cfg)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LORA["lr"])
-    rows = [json.loads(line) for line in open(dataset_path, encoding="utf-8")]
+    with open(dataset_path, encoding="utf-8") as fh:
+        rows = [json.loads(line) for line in fh if line.strip()]
     rng = random.Random(SEED)
     model.train()
     for step in range(steps):
@@ -133,6 +184,11 @@ def train(dataset_path: str, base_dir: str, out_dir: str, steps: int = 200) -> s
     os.makedirs(out_dir, exist_ok=True)
     model.save_pretrained(out_dir)
     return out_dir
+
+
+def measure_gate(old_before: float, old_after: float, ppl_before: float, ppl_after: float) -> dict:
+    """Единая точка решения: принимает уже измеренные величины и сохраняет их в отчёте гейта."""
+    return accept_adapter(old_before, old_after, ppl_before, ppl_after)
 
 
 def convert(adapter_dir: str, base_dir: str, outfile: str, llama_cpp_dir: str) -> str:
