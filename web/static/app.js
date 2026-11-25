@@ -3140,10 +3140,15 @@
         if (graph.pathNodeIds.has(n.id) && !candidates.includes(n)) candidates.unshift(n);
       }
     }
+    const hot = graph.nodes.filter((n) => (n.activation || 0) > 0)
+      .sort((a, b) => (b.activation || 0) - (a.activation || 0)).slice(0, 8);
+    for (const n of hot) if (!candidates.includes(n)) candidates.unshift(n);
     if (hi && !candidates.includes(hi)) candidates.unshift(hi);
     ctx.font = Math.round(12 * inv) + 'px system-ui, -apple-system, Segoe UI, sans-serif';
     ctx.textBaseline = 'middle';
     for (const n of candidates) {
+      const pathNode = pathMode && graph.pathNodeIds.has(n.id);
+      const activeNode = (n.activation || 0) > 0;
       const text = shorten(n.label, 28);
       const x = n.x + n.r + 7 * inv;
       const y = n.y;
@@ -3151,13 +3156,13 @@
       const h = 14 * inv;
       const box = { x, y: y - h / 2, w, h };
       const hit = labels.some((b) => box.x < b.x + b.w + 6 * inv && box.x + box.w + 6 * inv > b.x && box.y < b.y + b.h + 4 * inv && box.y + box.h + 4 * inv > b.y);
-      if (hit && n !== hi && !selIds.has(n.id)) continue;
+      if (hit && n !== hi && !selIds.has(n.id) && !pathNode && !activeNode) continue;
       labels.push(box);
-      const pathNode = pathMode && graph.pathNodeIds.has(n.id);
-      const dim = (hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id))) ||
-        (pathMode && !pathNode && !hi);
+      const dim = (hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id) || activeNode)) ||
+        (pathMode && !pathNode && !hi && !activeNode);
       ctx.fillStyle = dim ? 'rgba(236,238,241,0.18)'
-        : pathNode ? '#ffd36e' : 'rgba(236,238,241,0.95)';
+        : pathNode ? '#ffd36e'
+        : activeNode ? '#dce9ff' : 'rgba(236,238,241,0.95)';
       ctx.fillText(text, x, y);
     }
   }
