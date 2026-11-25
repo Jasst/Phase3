@@ -64,6 +64,8 @@ class Fact:
     last_accessed: Optional[str] = None
     salience: float = 0.8          # salience_0 для decay (A5), по умолчанию = confidence
     corroborations: list = field(default_factory=list)  # подтверждения из других документов (provenance)
+    boost: float = 0.0             # Phase4: подкрепление пути активации, не путать с I10 access_count
+    boost_at: Optional[str] = None # Phase4: когда подкрепление последний раз менялось (для затухания)
 
     def end(self) -> Optional[datetime]:
         """Момент прекращения действия: min(valid_to, invalid_at); None — открыт."""
@@ -115,7 +117,7 @@ class FactJournal:
                 if durable:
                     os.fsync(f.fileno())
         self._apply(rec)
-        if rec["op"] not in ("access", "adjust"):   # кэши графа зависят от состава фактов, не от счётчиков
+        if rec["op"] not in ("access", "adjust", "reinforce"):  # кэши зависят от состава фактов, не от счётчиков
             self.generation += 1
 
     def _replay_file(self) -> None:
@@ -160,6 +162,15 @@ class FactJournal:
                 if f is not None:
                     f.access_count += 1
                     f.last_accessed = rec["at"]
+        elif op == "reinforce":                   # Phase4: подкрепление/ослабление пройденного пути
+            amount = float(rec.get("amount", 0.0))
+            at = rec.get("at")
+            for fid in rec["fact_ids"]:
+                f = self.facts.get(fid)
+                if f is not None:
+                    f.boost = max(0.0, min(1.0, f.boost + amount))
+                    if at:
+                        f.boost_at = at
         elif op == "supersede":
             new = Fact(**rec["fact"])
             if new.fact_id in self.facts:  # I7: повтор после replay
@@ -298,6 +309,17 @@ class FactJournal:
             # без fsync: потеря последнего счётчика обращений при сбое допустима, запись на каждом поиске — нет
             self._append({"op": "access", "fact_ids": ids, "at": at or now_iso()}, durable=False)
 
+    def reinforce(self, fact_ids, amount: float, at: Optional[str] = None) -> None:
+        """Phase4: сдвинуть подкрепление пути. amount > 0 — успех, < 0 — ошибка.
+
+        Не меняет access_count (I10) и не требует fsync: это оценочный слой, а не источник истины.
+        """
+        ids = [i for i in fact_ids if i in self.facts]
+        if not ids or not amount:
+            return
+        self._append({"op": "reinforce", "fact_ids": ids, "amount": round(float(amount), 4),
+                      "at": at or now_iso()}, durable=False)
+
     def query(self, s=None, r=None, o=None, as_of: Optional[str] = None) -> List[Fact]:
         """Действующие факты на момент as_of (ось valid-time). Retract-нутые не возвращаются."""
         t = _dt(as_of or now_iso())
@@ -339,6 +361,8 @@ class FactJournal:
                     bad.append(f"{f.fact_id}: I1 подтверждение без источника: {exc}")
             if f.access_count > 0 and f.last_accessed is None:
                 bad.append(f"{f.fact_id}: I10 access_count>0 без last_accessed")
+            if not 0.0 <= f.boost <= 1.0:
+                bad.append(f"{f.fact_id}: Phase4 boost вне [0, 1]")
             if f.supersedes is not None:
                 old = self.facts.get(f.supersedes)
                 if old is None or old.invalid_at is None or _dt(old.invalid_at) != _dt(f.valid_from):
@@ -374,4 +398,5 @@ def fact_to_dict(f) -> dict:
         "recorded_at": f.recorded_at, "invalid_at": f.invalid_at,
         "retracted": f.retracted, "confidence": f.confidence,
         "source": f.source, "supersedes": f.supersedes, "functional": f.functional,
+        "access_count": f.access_count, "boost": round(f.boost, 4), "boost_at": f.boost_at,
     }

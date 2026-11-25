@@ -36,6 +36,7 @@
   GET  /api/memory/graph       карта нейронов: узлы, связи, рост по дням
   POST /api/memory/ingest      сохранить текст (синхронно, с экстракцией)
   POST /api/memory/search      поиск (recall)
+  POST /api/memory/think       фаза 4: импульс по графу (query + goal) → мысль
   POST /api/memory/confirm     подтвердить / опровергнуть факт
   POST /api/memory/retract     отозвать факт
   POST /api/memory/link        привязать написание к сущности
@@ -742,7 +743,8 @@ def _ingest(h, b, _q):
 
 def _graph(h, _b, q):
     limit = int((q.get("limit") or ["200"])[0])
-    h.send_json(h.app.graph(max_edges=max(10, min(limit, 1000))))
+    h.send_json(h.app.graph(max_edges=max(10, min(limit, 1000)),
+                            scope="web:" + (getattr(h, "uid", None) or "")))
 
 
 def _tools(h, _b, _q):
@@ -754,6 +756,23 @@ def _search(h, b, _q):
     if not query:
         raise ValueError("пустой запрос")
     h.send_json(h.app.memory.recall(query, as_of=b.get("as_of"), k_facts=int(b.get("k", 8))))
+
+
+def _think(h, b, _q):
+    """Фаза 4: пустить активационный поток и вернуть Thought для графа и агента."""
+    query = (b.get("query") or "").strip()
+    if not query:
+        raise ValueError("пустой запрос")
+    mem = h.app.memory
+    result = mem.think(
+        query,
+        goal=str(b.get("goal") or ""),
+        as_of=b.get("as_of"),
+        k=int(b.get("k", 8)),
+        steps=int(b.get("steps", 3)),
+        scope="web:" + (getattr(h, "uid", None) or ""),
+    )
+    h.send_json(result)
 
 
 def _confirm(h, b, _q):
@@ -947,6 +966,7 @@ ROUTES = {
     ("DELETE", "/api/mcp/token"): _mcp_token_revoke,
     ("POST", "/api/memory/ingest"): _ingest,
     ("POST", "/api/memory/search"): _search,
+    ("POST", "/api/memory/think"): _think,
     ("POST", "/api/memory/confirm"): _confirm,
     ("POST", "/api/memory/retract"): _retract,
     ("POST", "/api/memory/link"): _link,

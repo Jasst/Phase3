@@ -819,6 +819,12 @@ body.compact .welcome { padding: 16px 8px; }
 
 /* ---------- карта нейронов ---------- */
 .graph-stats { font-size: 12.5px; color: var(--text-muted); margin-bottom: 8px; overflow-wrap: anywhere; }
+.graph-trace { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -2px 0 8px; font-size: 11.5px; color: var(--text-secondary); }
+.graph-trace[hidden] { display: none; }
+.graph-trace .trace-title { color: var(--text-muted); margin-right: 2px; }
+.graph-trace .trace-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px; border: 1px solid rgba(255, 211, 110, .28); background: rgba(255, 211, 110, .07); border-radius: 999px; }
+.graph-trace .trace-idx { color: #ffd36e; font-weight: 600; }
+.graph-trace .trace-val { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-muted); cursor: pointer; user-select: none; }
 .graph-stage {
   position: relative; height: 420px; border: 1px solid var(--border-color); border-radius: 14px; overflow: hidden;

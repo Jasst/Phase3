@@ -189,12 +189,18 @@
     </section>
 
     <section class="pane" id="pane-graph" role="tabpanel">
+      <form class="inline-form" id="graphThinkForm">
+        <input id="graphThinkQuery" placeholder="Вопрос к графу" autocomplete="off" aria-label="Вопрос для импульса">
+        <input id="graphThinkGoal" placeholder="Цель (направление мысли)" autocomplete="off" aria-label="Цель импульса">
+        <button class="btn-primary" type="submit">Пустить импульс</button>
+      </form>
       <div class="pane-bar">
         <button class="btn-ghost" id="graphReload" type="button">Обновить</button>
         <button class="btn-ghost" id="graphRelayout" type="button" title="Плавно переложить узлы заново">Разложить</button>
         <label class="check"><input type="checkbox" id="graphLive" checked> обновлять каждые 4 с</label>
       </div>
       <div class="graph-stats" id="graphStats"></div>
+      <div class="graph-trace" id="graphTrace" hidden></div>
       <div class="graph-stage" id="graphStage">
         <canvas id="graphCanvas" aria-label="Карта нейронов памяти" role="img"></canvas>
         <div class="graph-controls" aria-label="Управление картой">
@@ -203,7 +209,7 @@
           <button class="icon-btn" id="graphZoomReset" type="button" title="Сбросить масштаб">⌖</button>
           <button class="icon-btn" id="graphFullscreen" type="button" title="На весь экран">⛶</button>
         </div>
-        <div class="graph-hint">клик — выбрать · Ctrl/⌘+клик — выделить несколько · перетащить узел — закрепить · тянуть фон — перемещать карту · колесо/щипок — масштаб · правый клик/долгое нажатие — меню</div>
+        <div class="graph-hint">клик — выбрать · Ctrl/⌘+клик — выделить несколько · перетащить узел — закрепить · тянуть фон — перемещать карту · колесо/щипок — масштаб · стрелка — направление связи · правый клик/долгое нажатие — меню</div>
         <div class="graph-empty" id="graphEmpty" hidden>Нейронов пока нет. Они появятся, когда в памяти появятся факты.</div>
       </div>
       <div class="graph-legend" id="graphLegend"></div>

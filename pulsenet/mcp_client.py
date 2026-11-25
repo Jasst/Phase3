@@ -70,8 +70,9 @@ def _content_text(content) -> str:
 
 # Инструменты только для чтения: при сбое связи их можно повторить один раз.
 # Записи (triplex_ingest и т. п.) не повторяем, чтобы не создать дубль.
-READ_TOOLS = frozenset({"triplex_search", "triplex_facts", "triplex_graph", "triplex_stats",
-                        "activity_recent", "pulsenet_guide", "whoami", "web_search", "web_fetch"})
+READ_TOOLS = frozenset({"triplex_search", "triplex_think", "triplex_facts", "triplex_graph",
+                        "triplex_stats", "activity_recent", "pulsenet_guide", "whoami",
+                        "web_search", "web_fetch"})
 RETRY_DELAY = 0.7
 
 
@@ -176,11 +177,28 @@ class RemoteMemory:
         self.client = client
 
     def recall(self, query: str, as_of: Optional[str] = None, k_facts: int = 8,
-               include_archived: bool = False) -> dict:
-        args: Dict[str, Any] = {"query": query, "k": int(k_facts), "include_archived": bool(include_archived)}
+               include_archived: bool = False, activate: bool = True,
+               remember_thought: bool = True) -> dict:
+        args: Dict[str, Any] = {"query": query, "k": int(k_facts),
+                                "include_archived": bool(include_archived),
+                                "activate": bool(activate),
+                                "remember_thought": bool(remember_thought)}
         if as_of:
             args["as_of"] = as_of
         return self.client.call("triplex_search", args)
+
+    def think(self, query: str, goal: str = "", k: int = 8, steps: int = 3,
+              as_of: Optional[str] = None, scope: str = "") -> dict:
+        args: Dict[str, Any] = {"query": query, "goal": goal, "k": int(k), "steps": int(steps)}
+        if as_of:
+            args["as_of"] = as_of
+        return self.client.call("triplex_think", args)
+
+    def feedback(self, fact_ids: List[str], valence: float, thought_id: Optional[str] = None) -> dict:
+        args = {"fact_ids": list(fact_ids), "valence": float(valence)}
+        if thought_id:
+            args["thought_id"] = thought_id
+        return self.client.call("triplex_feedback", args)
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",
                recorded_at: Optional[str] = None, model: str = "") -> dict:
@@ -197,7 +215,7 @@ class RemoteMemory:
     def stats(self) -> dict:
         return self.client.call("triplex_stats").get("memory", {})
 
-    def graph(self, max_edges: int = 200) -> dict:
+    def graph(self, max_edges: int = 200, scope: str = "") -> dict:
         return self.client.call("triplex_graph", {"max_edges": int(max_edges)})
 
     def list_facts(self, limit: int = 50) -> List[dict]:

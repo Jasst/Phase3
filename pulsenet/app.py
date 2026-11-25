@@ -700,7 +700,8 @@ class App:
                 "источники указаны):\n" + ctx)
 
     def _tool_recall(self, query: str, k: int) -> dict:
-        return self.memory.recall(query, k_facts=k)
+        # Инструмент чата не должен перезаписывать мысль, пущенную пользователем в графе.
+        return self.memory.recall(query, k_facts=k, activate=True, remember_thought=False)
 
     def _tool_remember(self, text: str, chat_id: str) -> dict:
         if not self.memory_enabled:
@@ -708,9 +709,9 @@ class App:
         self.index_async(text, chat_id, "user", force=True)
         return {"status": "queued"}
 
-    def graph(self, max_edges: int = 200) -> dict:
+    def graph(self, max_edges: int = 200, scope: str = "") -> dict:
         """Карта «нейронов» памяти для интерфейса и других клиентов."""
-        return self.memory.graph(max_edges=max_edges)
+        return self.memory.graph(max_edges=max_edges, scope=scope)
 
     def describe_tools(self) -> dict:
         return catalog()

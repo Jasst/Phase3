@@ -5,6 +5,7 @@
   память ТРИПЛЕКСИИ : triplex_ingest, triplex_search, triplex_query, triplex_assert,
                       triplex_supersede, triplex_retract, triplex_confirm,
                       triplex_define_relation, triplex_stats, triplex_check
+  фаза 4            : triplex_think (импульс/мысль), triplex_feedback (валентность)
   память (сервис)   : triplex_graph (карта нейронов), activity_recent (журнал действий)
   личность          : identity_propose, identity_commit, identity_chain
   общее ядро        : core_get; core_propose / core_commit — только администратор
@@ -190,12 +191,56 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                        k: int = Field(8, ge=1, le=50),
                        as_of: Optional[str] = Field(None, description="ISO 8601, по умолчанию сейчас"),
                        include_archived: bool = Field(False),
+                       goal: str = Field("", description="Активная цель: задаёт направление импульса"),
+                       activate: bool = Field(True, description="Пускать активационный поток по графу"),
+                       remember_thought: bool = Field(
+                           True, description="Сохранять мысль для графа и обратной связи"),
                        ctx: Context = None) -> Dict[str, Any]:
-        """Гибридный поиск по памяти: факты с источниками и фрагменты документов, готовый context."""
+        """Гибридный поиск: активация графа + факты с источниками + фрагменты документов."""
         uid, mem, e = mem_of(ctx)
         if e:
             return e
-        return mem.recall(query, as_of=as_of, k_facts=k, include_archived=include_archived)
+        return mem.recall(query, as_of=as_of, k_facts=k, include_archived=include_archived,
+                          activate=activate, goal=goal, scope="mcp:" + uid,
+                          remember_thought=remember_thought)
+
+    @mcp.tool()
+    @audit("triplex_think", lambda k: f"{k.get('query', '')} | {k.get('goal', '')}")
+    def triplex_think(query: str = Field(..., description="Вопрос или тема"),
+                      goal: str = Field("", description="Зачем: цель направляет импульс"),
+                      k: int = Field(8, ge=1, le=50),
+                      steps: int = Field(3, ge=1, le=8),
+                      as_of: Optional[str] = Field(None, description="ISO 8601, по умолчанию сейчас"),
+                      ctx: Context = None) -> Dict[str, Any]:
+        """Фаза 4: пустить импульс по графу и вернуть мысль — путь, активацию и источники."""
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        return mem.think(query, goal=goal, as_of=as_of, k=k, steps=steps, scope="mcp:" + uid)
+
+    @mcp.tool()
+    @audit("triplex_feedback", lambda k: f"{len(k.get('fact_ids') or [])} × {k.get('valence')}")
+    def triplex_feedback(fact_ids: List[str] = Field(..., min_length=1,
+                                                     description="Путь из triplex_think, по порядку"),
+                         valence: float = Field(..., ge=-1, le=1,
+                                                description=">0 — мысль подтвердилась, <0 — ошибка"),
+                         thought_id: Optional[str] = Field(
+                             None, description="id из triplex_think; без него берётся последняя мысль"),
+                         ctx: Context = None) -> Dict[str, Any]:
+        """Фаза 4: обратное кредитование пути (limbic-like), без изменения I10.
+
+        Факты должны принадлежать этой мысли: произвольный id не подкрепляется.
+        """
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        try:
+            out = mem.feedback(fact_ids, valence, thought_id=thought_id, scope="mcp:" + uid)
+        except (ValueError, KeyError) as exc:
+            return _err(str(exc))
+        if out.get("status") == "rejected":
+            return _err(out.get("message", "мысль не подтверждена"))
+        return out
 
     @mcp.tool()
     @audit("triplex_query", lambda k: f"{k.get('s')} {k.get('r')} {k.get('o')}")
@@ -508,7 +553,7 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         uid, mem, e = mem_of(ctx)
         if e:
             return e
-        return mem.graph(max_edges=max_edges)
+        return mem.graph(max_edges=max_edges, scope="mcp:" + uid)
 
     @mcp.tool()
     def activity_recent(limit: int = Field(30, ge=1, le=200), ctx: Context = None) -> Dict[str, Any]:
@@ -533,6 +578,9 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                         "документов; ответы без источника не записываются."),
             "workflow": [
                 "Перед нетривиальной задачей: triplex_search с формулировкой задачи.",
+                "Фаза 4: triplex_think(query, goal) — пустить импульс и получить мысль с путём;",
+                "если мысль подтвердилась/опровергнулась — triplex_feedback(path, valence, "
+                "thought_id из результата think); чужие id не принимаются.",
                 "После решения: triplex_ingest (получить doc_id), затем triplex_assert с источником.",
                 "Свежие факты, документация, сравнения: web_search, затем web_fetch для полного текста.",
                 "Картинка по описанию: image_generate (локальный EasyDiffusion, fallback на Pollinations).",
@@ -541,7 +589,9 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
             ],
             "tools": {
                 "triplex_ingest": "сохранить документ, извлечь факты (doc_id нужен для triplex_assert)",
-                "triplex_search": "гибридный поиск: факты с источниками и фрагменты",
+                "triplex_search": "гибридный поиск + активация графа (goal задаёт направление)",
+                "triplex_think": "импульс по графу: активация, путь мысли, источники",
+                "triplex_feedback": "валентность мысли: подкрепить или ослабить пройденный путь",
                 "triplex_query": "действующие факты по субъекту, отношению или объекту",
                 "triplex_assert / triplex_supersede / triplex_retract / triplex_confirm": "записать, "
                     "вытеснить, отозвать, подтвердить или опровергнуть факт",

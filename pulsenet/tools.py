@@ -198,6 +198,33 @@ def _int(value: Any, default: int, lo: int, hi: int) -> int:
         return default
 
 
+def _thought_brief(thought: Any, limit: int = 6) -> List[str]:
+    """Компактный путь мысли для модели: не весь JSON, а направление и источники."""
+    if not isinstance(thought, dict) or thought.get("status") != "ok":
+        return []
+    goal = _str(thought.get("goal"))
+    head = "Путь мысли" + (f" к цели «{_clip(goal, 60)}»" if goal else "") + ":"
+    lines = [head]
+    path = thought.get("path") or []
+    for i, item in enumerate(path[:limit], 1):
+        text = _clip(item.get("text") or item.get("fact_id") or "?", 130)
+        bits = []
+        rel = _str(item.get("relation"))
+        if rel:
+            bits.append(rel)
+        try:
+            bits.append(f"активация {float(item.get('activation')):.2f}")
+        except (TypeError, ValueError):
+            pass
+        src = item.get("source") or {}
+        if isinstance(src, dict) and src.get("doc_id"):
+            bits.append(_clip(src["doc_id"], 24))
+        lines.append(f"{i}. {text}" + (" [" + ", ".join(bits) + "]" if bits else ""))
+    if len(path) > limit:
+        lines.append(f"… ещё {len(path) - limit} звеньев")
+    return lines
+
+
 def _web_module():
     """Модуль веб-поиска. Импорт ленивый: без httpx чат работает, просто без интернета."""
     try:
@@ -481,7 +508,8 @@ class ChatTools:
         facts = [f"- {f.get('text', '')} (уверенность {f.get('confidence', '?')})"
                  for f in r.get("facts", [])]
         chunks = [f"> {_clip(c.get('text', ''), 400)}" for c in r.get("chunks", [])]
-        if not facts and not chunks:
+        thought_lines = _thought_brief(r.get("thought"))
+        if not facts and not chunks and not thought_lines:
             text = "В памяти ничего не найдено."
         else:
             parts = []
@@ -489,9 +517,12 @@ class ChatTools:
                 parts += ["Факты:"] + facts
             if chunks:
                 parts += ["Фрагменты документов:"] + chunks
+            if thought_lines:
+                parts += [""] + thought_lines
             text = "\n".join(parts)
         return Outcome(True, text, label=f"Память: «{_clip(query, 50)}»",
-                       detail=f"фактов: {len(facts)}, фрагментов: {len(chunks)}")
+                       detail=f"фактов: {len(facts)}, фрагментов: {len(chunks)},"
+                              f" путь: {len(thought_lines) - 1 if thought_lines else 0}")
 
     def _memory_remember(self, args: dict) -> Outcome:
         text = _str(args.get("text"))
