@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .journal import Fact
+from .journal import Fact, _dt
 
 ACT_STEPS = 3
 ACT_TOP_K = 16
@@ -42,6 +43,9 @@ ACT_LEARNING = 0.45
 ACT_THRESHOLD = 0.002
 ACT_REINFORCE = 0.04
 ACT_MEMORY = 0.70
+BOOST_HALF_LIFE_SEC = 600.0   # 10 мин: подкрепление не должно навсегда закреплять факт в лидерах
+BOOST_USAGE_WEIGHT = 0.5      # вклад boost в usage меньше, чем вклад реальных обращений
+BOOST_USAGE_CAP = 0.30        # потолок надбавки к весу ребра от usage
 
 
 @dataclass
@@ -99,11 +103,27 @@ def availability(mem, f: Fact, t) -> float:
     return prior * (0.6 + 0.4 * f.confidence)
 
 
+def effective_boost(f: Fact, t) -> float:
+    """Действующее подкрепление с учётом времени. Журнал хранит исходный boost, здесь он не меняется."""
+    b = max(0.0, min(1.0, float(getattr(f, "boost", 0.0) or 0.0)))
+    if b <= 0.0:
+        return 0.0
+    boost_at = getattr(f, "boost_at", None)   # старые записи без времени — как необновлённые
+    if not boost_at:
+        return b
+    try:
+        now = t if isinstance(t, datetime) else _dt(t)
+        age = max(0.0, (now - _dt(boost_at)).total_seconds())
+    except (TypeError, ValueError):
+        return b
+    return b * (0.5 ** (age / BOOST_HALF_LIFE_SEC))
+
+
 def edge_weight(mem, f: Fact, t, fact_cos: float = 0.0) -> float:
     """Единый вес синапса: уверенность × время × usage × онтология × кью."""
     w = f.confidence * mem.decay_factor(f, t)
-    usage = math.log1p(max(0, f.access_count) + 2.0 * max(0.0, f.boost))
-    w *= 1.0 + 0.12 * min(usage, 3.0)
+    usage = math.log1p(max(0, f.access_count) + BOOST_USAGE_WEIGHT * effective_boost(f, t))
+    w *= 1.0 + min(BOOST_USAGE_CAP, 0.12 * min(usage, 3.0))
     rel = mem.relations.get(f.r, {})
     if not rel.get("proposed"):
         w *= 1.15

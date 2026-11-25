@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
@@ -103,9 +104,9 @@ class TriplexMemory:
 
         self._load_meta()
         self._chunk_by_id: Dict[str, object] = {c.chunk_id: c for c in self.docs.all_chunks()}
-        self._adj_cache: Optional[Tuple[int, Dict[str, List[Fact]]]] = None
-        self._last_thought: Optional[dict] = None   # Phase4: слепок последнего импульса (в памяти процесса)
-        self._last_thought_at: Optional[float] = None  # время импульса для затухания следа
+        self._adj_cache: Optional[Tuple[frozenset, Dict[str, List[Fact]]]] = None
+        # Phase4: след мысли хранится по ключу (агент/сессия), а не одной переменной на всю память.
+        self._thoughts: Dict[str, dict] = {}
         self._rebuild_indexes()
 
     # ---------- метаданные: сущности и отношения ----------
@@ -391,7 +392,8 @@ class TriplexMemory:
     def recall(self, query: str, as_of: Optional[str] = None, k_facts: int = 8, k_chunks: int = 4,
                coarse: int = 24, depth: int = 2, include_archived: bool = False,
                budget_facts_chars: int = 3200, budget_chunks_chars: int = 1600,
-               activate: bool = False, goal: str = "", steps: int = 3) -> dict:
+               activate: bool = False, goal: str = "", steps: int = 3,
+               scope: str = "", remember_thought: bool = True) -> dict:
         with self._lock:
             as_of = as_of or _now()
             t = _dt(as_of)
@@ -418,6 +420,7 @@ class TriplexMemory:
             # Stage 2: expand. Phase4 — активационный поток вместо плоского BFS.
             # Старый BFS остаётся за activate=False (регрессии и дешёвый путь).
             thought: Optional[activation_layer.Thought] = None
+            thought_meta: Optional[dict] = None
             if activate and seeds:
                 cue_text = " ".join(x for x in (query, goal or "") if x).strip()
                 cue_vec = self.encoder.embed_query([cue_text])[0]
@@ -429,8 +432,10 @@ class TriplexMemory:
                 candidates = list(dict.fromkeys(
                     seeds + thought.path + [fid for fid in path_w if fid not in seeds]
                 ))
-                self._last_thought = thought.to_dict(self)
-                self._last_thought_at = time.monotonic()
+                thought_meta = thought.to_dict(self)
+                if remember_thought:
+                    thought_meta["thought_id"] = uuid.uuid4().hex[:12]
+                    self._thoughts[scope] = {"thought": thought_meta, "at": time.monotonic()}
             else:
                 adj = self._adjacency(live)
                 path_w = {}
@@ -447,6 +452,8 @@ class TriplexMemory:
                     if d >= depth:
                         continue
                     for f in adj.get(ent, []):
+                        if f.fact_id not in by_id:   # кэш смежности может быть построен для другого as_of
+                            continue
                         other = f.o if f.s == ent else f.s
                         if other == ent:
                             continue
@@ -523,33 +530,76 @@ class TriplexMemory:
                            "confidence": by_id[fid].confidence} for fid in top_facts],
                 "chunks": [{"chunk_id": cid, "text": chunk_by_id[cid].text} for cid in top_chunks],
                 "context": "\n".join(ctx_lines),
-                "thought": thought.to_dict(self) if thought is not None else None,
+                "thought": thought_meta,
             }
 
     # ---------- Phase4: мысль и валентность ----------
 
     def think(self, query: str, goal: str = "", as_of: Optional[str] = None,
-              k: int = 8, steps: int = 3) -> dict:
+              k: int = 8, steps: int = 3, scope: str = "") -> dict:
         """Запустить активационный поток и вернуть Thought (а не просто top-k фактов)."""
-        r = self.recall(query, as_of=as_of, k_facts=k, activate=True, goal=goal, steps=steps)
+        r = self.recall(query, as_of=as_of, k_facts=k, activate=True, goal=goal,
+                        steps=steps, scope=scope)
         return r["thought"] or {"status": "empty", "query": query, "goal": goal,
                                 "steps": [], "path": [], "facts": [], "activation": {}}
 
-    def feedback(self, fact_ids: List[str], valence: float) -> dict:
-        """Обратное распространение оценки по пути мысли: valence ∈ [-1, 1]."""
-        updates = activation_layer.apply_valence(self, fact_ids or [], valence)
+    def feedback(self, fact_ids: List[str], valence: float, thought_id: Optional[str] = None,
+                 scope: Optional[str] = None) -> dict:
+        """Обратное кредитование по пути мысли: valence ∈ [-1, 1].
+
+        Если передан scope (MCP/интерфейс), факты должны принадлежать сохранённой
+        мысли — иначе агент мог бы подкрепить произвольный факт. Локальные вызовы
+        без scope сохраняют старое поведение для регрессий и тестов.
+        """
+        ids = [str(i) for i in (fact_ids or [])]
+        if scope is not None:
+            thought, err = self._feedback_thought(ids, thought_id, scope)
+            if err:
+                return {"status": "rejected", "message": err}
+        updates = activation_layer.apply_valence(self, ids, valence)
         return {"status": "ok", "updates": [{"fact_id": fid, "amount": a} for fid, a in updates]}
 
+    def _feedback_thought(self, fact_ids: List[str], thought_id: Optional[str],
+                          scope: str) -> Tuple[Optional[dict], str]:
+        """Найти мысль по id (или последнюю в scope) и проверить, что факты из неё."""
+        entry, entry_key = None, scope
+        if thought_id:
+            for key, e in self._thoughts.items():
+                if e["thought"].get("thought_id") == thought_id:
+                    entry, entry_key = e, key
+                    break
+            if entry is None:
+                return None, "мысль с таким thought_id не найдена или уже угасла"
+        else:
+            entry = self._thoughts.get(scope)
+            if entry is None:
+                return None, "нет мысли: сначала вызовите think() или search(activate=True)"
+        thought, _ = self._decay_thought(entry)
+        if thought is None:
+            self._thoughts.pop(entry_key, None)
+            return None, "мысль угасла: пустите импульс заново"
+        allowed = {line["fact_id"] for line in (thought.get("path") or [])
+                   if isinstance(line, dict) and line.get("fact_id")}
+        allowed.update((thought.get("activation") or {}).keys())
+        extra = [fid for fid in fact_ids if fid not in allowed]
+        if extra:
+            return None, "факты не из этой мысли: " + ", ".join(extra[:5])
+        return thought, ""
+
     def _adjacency(self, live: List[Fact]) -> Dict[str, List[Fact]]:
-        """Смежность сущностей для обхода. Пересобирается только при изменении состава фактов."""
-        gen = self.journal.generation
-        if self._adj_cache is not None and self._adj_cache[0] == gen:
+        """Смежность сущностей для обхода.
+
+        Ключ кэша — состав актуальных фактов, а не только generation журнала:
+        при одном и том же generation разные as_of и архив дают разные графы.
+        """
+        key = (self.journal.generation, frozenset(f.fact_id for f in live))
+        if self._adj_cache is not None and self._adj_cache[0] == key:
             return self._adj_cache[1]
         adj: Dict[str, List[Fact]] = {}
         for f in live:
             adj.setdefault(f.s, []).append(f)
             adj.setdefault(f.o, []).append(f)
-        self._adj_cache = (gen, adj)
+        self._adj_cache = (key, adj)
         return adj
 
     def assert_triple(self, s_name: str, r: str, o_name: str, *, source: dict, confidence: float = 0.8,
@@ -632,28 +682,31 @@ class TriplexMemory:
                 "extractor": self.extractor is not None,
             }
 
-    def _live_thought(self) -> Tuple[Optional[dict], Dict[str, float]]:
-        """След мысли с учётом полураспада. Возвращает (мета, угасшая_активация).
-
-        Мысль — не постоянное состояние графа: она живёт в памяти процесса и
-        должна угасать, иначе подсветка в интерфейсе «залипает». Затухание
-        считается от времени последнего импульса и не пишется в журнал.
-        """
-        if not self._last_thought:
-            return None, {}
-        elapsed = max(0.0, time.monotonic() - (self._last_thought_at or 0.0))
+    def _decay_thought(self, entry: dict) -> Tuple[Optional[dict], Dict[str, float]]:
+        """Применить полураспад к следу мысли. Возвращает (мета, угасшая_активация)."""
+        source = entry["thought"]
+        elapsed = max(0.0, time.monotonic() - (entry.get("at") or 0.0))
         factor = 0.5 ** (elapsed / THOUGHT_HALF_LIFE_SEC)
         act = {fid: round(float(a) * factor, 4)
-               for fid, a in (self._last_thought.get("activation") or {}).items()}
+               for fid, a in (source.get("activation") or {}).items()}
         if not act or max(act.values()) < THOUGHT_CLEAR_BELOW:
-            self._last_thought = None
-            self._last_thought_at = None
             return None, {}
-        meta = dict(self._last_thought)
+        meta = dict(source)
         meta["activation"] = act
         return meta, act
 
-    def graph(self, max_edges: int = 400) -> dict:
+    def _live_thought(self, scope: str = "") -> Tuple[Optional[dict], Dict[str, float]]:
+        """Живой след мысли для заданного scope; угасший удаляется."""
+        entry = self._thoughts.get(scope)
+        if entry is None:
+            return None, {}
+        meta, act = self._decay_thought(entry)
+        if meta is None:
+            self._thoughts.pop(scope, None)
+            return None, {}
+        return meta, act
+
+    def graph(self, max_edges: int = 400, scope: str = "") -> dict:
         """Срез памяти для визуализации: сущности — узлы («нейроны»), действующие факты — связи.
 
         Узел появляется, когда на него ссылается хотя бы один действующий факт; created — момент
@@ -678,7 +731,7 @@ class TriplexMemory:
                                   "created": None, "linked": ent is not None, "activation": 0.0}
                 return nodes[key]
 
-            thought, active_now = self._live_thought()
+            thought, active_now = self._live_thought(scope)
 
             def edge_strength(f: Fact) -> float:
                 # Собственный вес ребра без текущего запроса (кью-множитель = 1).
@@ -695,7 +748,8 @@ class TriplexMemory:
                         n["created"] = f.recorded_at
                 edges.append({"id": f.fact_id, "source": f.s, "target": f.o, "label": f.r,
                               "confidence": round(f.confidence, 3), "recorded_at": f.recorded_at,
-                              "access_count": f.access_count, "boost": round(f.boost, 3),
+                              "access_count": f.access_count,
+                              "boost": round(activation_layer.effective_boost(f, t), 3),
                               "weight": edge_strength(f), "activation": round(imp, 3)})
 
             per_day: Dict[str, int] = {}
@@ -711,6 +765,7 @@ class TriplexMemory:
             thought_meta = None
             if thought:
                 thought_meta = {
+                    "thought_id": thought.get("thought_id"),
                     "status": thought.get("status"),
                     "query": thought.get("query"),
                     "goal": thought.get("goal"),

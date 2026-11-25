@@ -743,7 +743,8 @@ def _ingest(h, b, _q):
 
 def _graph(h, _b, q):
     limit = int((q.get("limit") or ["200"])[0])
-    h.send_json(h.app.graph(max_edges=max(10, min(limit, 1000))))
+    h.send_json(h.app.graph(max_edges=max(10, min(limit, 1000)),
+                            scope="web:" + (getattr(h, "uid", None) or "")))
 
 
 def _tools(h, _b, _q):
@@ -769,6 +770,7 @@ def _think(h, b, _q):
         as_of=b.get("as_of"),
         k=int(b.get("k", 8)),
         steps=int(b.get("steps", 3)),
+        scope="web:" + (getattr(h, "uid", None) or ""),
     )
     h.send_json(result)
 

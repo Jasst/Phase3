@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """Phase4: активационный поток, мысль и обратное кредитование пути."""
+from datetime import timedelta
+
 import pytest
 
 from pulsenet.triplex import HashEncoder, TriplexMemory
-from pulsenet.triplex.journal import FactJournal
+from pulsenet.triplex.activation import BOOST_HALF_LIFE_SEC, effective_boost
+from pulsenet.triplex.journal import FactJournal, _dt
 from pulsenet.triplex.memory import THOUGHT_HALF_LIFE_SEC
 
 
@@ -99,6 +102,69 @@ def test_thought_activation_decays_and_then_clears(tmp_path, monkeypatch):
     g = mem.graph(50)
     assert g["thought"] is None
     assert all(e["activation"] == 0 for e in g["edges"])
+
+
+def test_adjacency_cache_respects_as_of(tmp_path):
+    """Кэш смежности, построенный для прошлого, не должен ломать поиск в настоящем."""
+    mem = TriplexMemory(str(tmp_path / "t"), encoder=HashEncoder(256))
+    src = {"doc_id": "d:1", "span": [0, 1]}
+    mem.journal.assert_fact("e1", "любит", "e2", source=src,
+                            valid_from="2026-01-01T00:00:00+00:00")
+    stale = mem.journal.assert_fact("e2", "лежит", "e3", source=src,
+                                    valid_from="2026-01-01T00:00:00+00:00",
+                                    valid_to="2026-02-01T00:00:00+00:00")
+    reopened = TriplexMemory(str(tmp_path / "t"), encoder=HashEncoder(256))
+
+    jan = reopened.recall("e1", as_of="2026-01-15T00:00:00+00:00", activate=False, depth=2)
+    assert stale.fact_id in [f["fact_id"] for f in jan["facts"]]
+
+    # Старый код здесь падал: adj из кэша содержал факт, которого нет в by_id.
+    mar = reopened.recall("e1", as_of="2026-03-01T00:00:00+00:00", activate=False, depth=2)
+    assert stale.fact_id not in [f["fact_id"] for f in mar["facts"]]
+
+
+def test_feedback_accepts_only_facts_from_thought(tmp_path):
+    mem, fid_a, fid_b = _memory(tmp_path)
+    thought = mem.think("Маша", goal="коврик", steps=2, scope="mcp:tester")
+    tid = thought["thought_id"]
+    foreign = mem.journal.assert_fact("ёж", "спит", "нора",
+                                      source={"doc_id": "d:1", "span": [0, 1]}).fact_id
+
+    bad = mem.feedback([foreign], 1.0, scope="mcp:tester")
+    assert bad["status"] == "rejected"
+    assert mem.journal.facts[foreign].boost == 0.0
+
+    good = mem.feedback([fid_b], 0.5, scope="mcp:tester")
+    assert good["status"] == "ok"
+    assert mem.journal.facts[fid_b].boost > 0
+
+    # Явно указанный id мысли действует и из другого scope, неизвестный — нет.
+    assert mem.feedback([fid_a], 0.3, thought_id=tid, scope="mcp:other")["status"] == "ok"
+    assert mem.feedback([fid_a], 0.3, thought_id="нет-такой", scope="mcp:other")["status"] == "rejected"
+
+
+def test_boost_decays_in_weight_but_not_in_journal(tmp_path):
+    mem, fid_a, _ = _memory(tmp_path)
+    mem.feedback([fid_a], 1.0)
+    f = mem.journal.facts[fid_a]
+    b0 = f.boost
+    t0 = _dt(f.boost_at)
+
+    assert effective_boost(f, t0) == pytest.approx(b0)
+    later = t0 + timedelta(minutes=BOOST_HALF_LIFE_SEC / 60)
+    assert effective_boost(f, later) == pytest.approx(b0 / 2)
+    assert f.boost == b0                         # журнал остался неизменным
+
+
+def test_thought_traces_are_isolated_by_scope(tmp_path):
+    mem, _, _ = _memory(tmp_path)
+    mem.think("Маша", goal="коврик", steps=2, scope="alice")
+    assert mem.graph(scope="alice")["thought"]["status"] == "ok"
+    assert mem.graph(scope="bob")["thought"] is None
+
+    mem.think("Маша", goal="коврик", steps=2, scope="bob")
+    assert mem.graph(scope="alice")["thought"]["status"] == "ok"
+    assert mem.graph(scope="bob")["thought"]["status"] == "ok"
 
 
 def test_journal_rejects_boost_out_of_range():
