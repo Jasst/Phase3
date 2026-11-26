@@ -59,7 +59,7 @@ class Settings:
     allowed_origins: List[str] = field(default_factory=lambda: ["http://127.0.0.1:*", "http://localhost:*"])
     identity_min_days: int = 2
     core_min_interval_hours: float = 24.0
-    memory_scope: str = "shared"            # shared — одна память для ваших агентов; per_user — изоляция
+    memory_scope: str = "shared"            # shared — память всех токенов сервера; per_user — изоляция
     env: Dict[str, str] = field(default_factory=dict)   # переменные для эмбеддера и экстрактора
 
     @classmethod
@@ -570,6 +570,40 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         uid, mem, e = mem_of(ctx)
         if e:
             return e
+        tools = {
+            "triplex_ingest": "text → doc_id; session_id, role, model, recorded_at",
+            "triplex_search": "query; k, goal, as_of, include_archived, activate, remember_thought",
+            "triplex_think": "query; goal, k, steps, as_of → path и thought_id",
+            "triplex_feedback": "fact_ids из thought.path, valence [-1,1], thought_id из triplex_think",
+            "triplex_query": "s/r/o/as_of — все фильтры необязательны",
+            "triplex_assert": "s, r, o, doc_id, span=[start,end], confidence, functional",
+            "triplex_supersede": "old_fact_id, s, r, o, valid_from, doc_id, span",
+            "triplex_facts": "limit — действующие факты с полем agent",
+            "triplex_link": "entity_id, alias — привязать написание к сущности",
+            "triplex_retract": "fact_id — отозвать факт, запись остаётся в журнале",
+            "triplex_confirm": "fact_id, yes — изменить уверенность (+0.15 или ×0.5)",
+            "triplex_define_relation": "canonical, aliases, functional, tau_days",
+            "triplex_stats": "счётчики памяти",
+            "triplex_check": "проверка инвариантов журнала",
+            "triplex_consolidate": "сухой прогон «сна»; обучение отдельно: python -m pulsenet train-sleep",
+            "triplex_graph": "max_edges — узлы и связи памяти",
+            "identity_propose": "content, kind, evidence_quote — цитата из памяти обязательна",
+            "identity_commit": "candidate_id — после карантина IDENTITY_MIN_DAYS",
+            "identity_chain": "история формулировок личности",
+            "core_get": "общее ядро, читают все",
+            "core_propose": "предложить изменение ядра — только администратор",
+            "core_commit": "применить изменение ядра — только администратор",
+            "web_search": "query или queries (до 4), max_results",
+            "web_fetch": "url — только публичные http(s), без редиректов",
+            "image_generate": "prompt; steps, width, height, cfg_scale, seed, sampler, negative_prompt, "
+                "backends, return_image",
+            "code_list": "root из CODE_ROOTS, subdir",
+            "code_read": "root, path, start, end — до 300 строк",
+            "code_search": "root, pattern — поиск без учёта регистра",
+            "activity_recent": "limit — журнал действий пользователя",
+            "pulsenet_guide": "этот описатель и текущее состояние",
+            "whoami": "кто вы для сервера и какие возможности доступны",
+        }
         return {
             "server": SERVER_NAME,
             "version": SERVER_VERSION,
@@ -578,36 +612,22 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                         "документов; ответы без источника не записываются."),
             "workflow": [
                 "Перед нетривиальной задачей: triplex_search с формулировкой задачи.",
-                "Фаза 4: triplex_think(query, goal) — пустить импульс и получить мысль с путём;",
-                "если мысль подтвердилась/опровергнулась — triplex_feedback(path, valence, "
-                "thought_id из результата think); чужие id не принимаются.",
-                "После решения: triplex_ingest (получить doc_id), затем triplex_assert с источником.",
+                "Фаза 4: triplex_think(query, goal) — пустить импульс и получить мысль с путём и thought_id;",
+                "если мысль подтвердилась/опровергнулась — triplex_feedback(fact_ids из thought.path, "
+                "valence, thought_id из triplex_think); чужие id не принимаются.",
+                "После решения: triplex_ingest (получить doc_id), затем triplex_assert с doc_id и span=[start,end].",
+                "Устаревший факт: triplex_supersede(old_fact_id, ..., valid_from, doc_id, span) или triplex_retract.",
                 "Свежие факты, документация, сравнения: web_search, затем web_fetch для полного текста.",
                 "Картинка по описанию: image_generate (локальный EasyDiffusion, fallback на Pollinations).",
                 "Что уже делалось и что сорвалось: activity_recent.",
                 "Что накоплено: triplex_graph (узлы и связи) или triplex_stats.",
             ],
-            "tools": {
-                "triplex_ingest": "сохранить документ, извлечь факты (doc_id нужен для triplex_assert)",
-                "triplex_search": "гибридный поиск + активация графа (goal задаёт направление)",
-                "triplex_think": "импульс по графу: активация, путь мысли, источники",
-                "triplex_feedback": "валентность мысли: подкрепить или ослабить пройденный путь",
-                "triplex_query": "действующие факты по субъекту, отношению или объекту",
-                "triplex_assert / triplex_supersede / triplex_retract / triplex_confirm": "записать, "
-                    "вытеснить, отозвать, подтвердить или опровергнуть факт",
-                "triplex_graph": "карта нейронов памяти",
-                "triplex_check": "проверка инвариантов журнала",
-                "web_search / web_fetch": "поиск в интернете и чтение публичной страницы",
-                "image_generate": "картинка по описанию: prompt, steps, width, height, seed, backends; "
-                    "возвращает file_path, url /images/... и саму картинку",
-                "activity_recent": "журнал действий пользователя",
-                "triplex_facts": "действующие факты с автором (agent)",
-                "triplex_link": "привязать написание к сущности",
-                "identity_*, core_*": "личная идентичность и общее ядро (с карантином)",
-            },
+            "tools": tools,
+            "tools_count": len(tools),
             "memory_scope": cfg.memory_scope,
-            "memory_note": ("общая память: все ваши агенты пишут в одно хранилище; автор каждого факта — "
-                            "поле agent" if cfg.memory_scope == "shared" else "память у каждого пользователя своя"),
+            "memory_note": ("общая память: все пользователи/токены сервера пишут в одно хранилище; "
+                            "автор каждого факта — поле agent"
+                            if cfg.memory_scope == "shared" else "память у каждого пользователя своя"),
             "state": mem.stats(),
             "recent_activity": activity.recent(uid, 5),
         }

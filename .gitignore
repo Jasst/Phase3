@@ -11,3 +11,4 @@ data/
 chats.sqlite*
 tokens.sqlite*
 *.zip
+/plugins

@@ -68,10 +68,31 @@ def test_new_tools_are_registered(server):
 
 
 def test_guide_describes_server_and_state(server):
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
     g = _call(server["url"], server["alice"], "pulsenet_guide")
     assert g["user"] == "alice"
-    assert "triplex_search" in g["tools"] and "web_search / web_fetch" in g["tools"]
+    assert "triplex_search" in g["tools"] and "web_search" in g["tools"]
     assert "state" in g and g["state"]["docs"] == 0
+
+    async def registered():
+        async with streamablehttp_client(server["url"],
+                                         headers={"Authorization": f"Bearer {server['alice']}"}) as (r, w, _):
+            async with ClientSession(r, w) as sess:
+                await sess.initialize()
+                return {t.name for t in (await sess.list_tools()).tools}
+
+    names = asyncio.run(registered())
+    described = json.dumps(g["tools"], ensure_ascii=False)
+    for name in sorted(names):
+        assert name in described, f"pulsenet_guide не описывает инструмент {name}"
+    assert g["tools_count"] == len(names) == 31
+
+    workflow = "\n".join(g["workflow"])
+    assert "triplex_feedback(fact_ids" in workflow
+    assert "triplex_feedback(path" not in workflow
+    assert "thought_id" in workflow
 
 
 def test_activity_records_operations_per_user(server):
@@ -93,11 +114,15 @@ def test_graph_is_shared_between_agents_and_shows_author(server):
     assert doc.get("doc_id")
     _call(server["url"], server["alice"], "triplex_assert",
           {"s": "Алиса", "r": "работает в", "o": "Lab", "doc_id": doc["doc_id"], "span": [0, 20]})
+    def has_alice(graph):
+        # id сущности может быть e:..., человекочитаемое имя лежит в label.
+        return any(n.get("id") == "Алиса" or n.get("label") == "Алиса" for n in graph["nodes"])
+
     g = _call(server["url"], server["alice"], "triplex_graph", {"max_edges": 50})
-    assert any(n["id"] == "Алиса" for n in g["nodes"])
+    assert has_alice(g)
     assert g["edges"] and g["growth"]
     other = _call(server["url"], server["bob"], "triplex_graph", {"max_edges": 50})
-    assert any(n["id"] == "Алиса" for n in other["nodes"])
+    assert has_alice(other)
     facts = _call(server["url"], server["bob"], "triplex_facts", {"limit": 50})["facts"]
     mine = [f for f in facts if f["text"].startswith("Алиса")]
     assert mine and mine[0]["agent"] == "alice"
