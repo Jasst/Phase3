@@ -110,6 +110,12 @@ def test_thoughts_and_reflect_tools(server):
     assert th["paths"] and [p["fact_id"] for p in th["path"]] == th["paths"][0]["ids"]
     tid = th["thought_id"]
 
+    # Карта нейронов видит ту же мысль со всеми путями Phase4+.
+    gt = _call(server["url"], server["alice"], "triplex_graph", {"max_edges": 50})["thought"]
+    assert gt and gt["thought_id"] == tid
+    assert gt["paths"] and gt["paths"][0]["ids"] == gt["path"]
+    assert isinstance(gt["open_fact_ids"], list) and isinstance(gt["conflicts"], list)
+
     history = _call(server["url"], server["alice"], "triplex_thoughts", {"limit": 5})
     assert any(t["thought_id"] == tid for t in history["thoughts"])
     assert _call(server["url"], server["bob"], "triplex_thoughts", {"limit": 5})["count"] == 0

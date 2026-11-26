@@ -904,14 +904,39 @@ class TriplexMemory:
 
             thought_meta = None
             if thought:
+                # Legacy-проекция (path — список id) остаётся для старых клиентов;
+                # Phase4+ добавляет все пути, альтернативы и сигналы для карты.
+                path_ids = [line["fact_id"] for line in thought.get("path", [])
+                            if line.get("fact_id")]
+                paths = [p for p in (thought.get("paths") or [])
+                         if isinstance(p, dict) and p.get("ids")]
+                if not paths and path_ids:
+                    paths = [{"ids": path_ids, "score": 0.0, "reason": "primary",
+                              "activation": 0.0}]
+                # Открытые вопросы приходят текстом; для «призрачных» рёбер
+                # сопоставляем их с фактами, реально попавшими в срез графа.
+                open_ids: List[str] = []
+                for question in (thought.get("open_questions") or []):
+                    for f in shown:
+                        if self._fact_text(f) == question:
+                            if f.fact_id not in open_ids:
+                                open_ids.append(f.fact_id)
+                            break
                 thought_meta = {
                     "thought_id": thought.get("thought_id"),
                     "status": thought.get("status"),
                     "query": thought.get("query"),
                     "goal": thought.get("goal"),
                     "path_length": thought.get("path_length", 0),
-                    "path": [line["fact_id"] for line in thought.get("path", [])
-                             if line.get("fact_id")],
+                    "path": path_ids,
+                    # Phase4+
+                    "subgoals": list(thought.get("subgoals") or []),
+                    "paths": paths,
+                    "alternatives": list(thought.get("alternatives") or []),
+                    "open_questions": list(thought.get("open_questions") or []),
+                    "open_fact_ids": open_ids,
+                    "conflicts": [c for c in (thought.get("conflicts") or [])
+                                  if isinstance(c, dict) and c.get("fact_ids")],
                 }
 
             return {

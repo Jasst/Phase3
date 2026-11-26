@@ -66,7 +66,7 @@
     searchForm: $('searchForm'), searchQuery: $('searchQuery'), searchResults: $('searchResults'),
     ingestText: $('ingestText'), ingestBtn: $('ingestBtn'), ingestOut: $('ingestOut'),
     graphReload: $('graphReload'), graphLive: $('graphLive'), graphStats: $('graphStats'),
-    graphTrace: $('graphTrace'),
+    graphPaths: $('graphPaths'), graphTrace: $('graphTrace'), graphNotes: $('graphNotes'),
     graphRelayout: $('graphRelayout'),
     graphThinkForm: $('graphThinkForm'), graphThinkQuery: $('graphThinkQuery'),
     graphThinkGoal: $('graphThinkGoal'),
@@ -2427,12 +2427,21 @@
     nodes: [], edges: [], byId: {}, W: 0, H: 0, dpr: 1, temp: 0, frames: 0, raf: 0,
     hover: null, selected: null, selectedIds: new Set(), busy: false, typeColors: {}, relColors: {}, pulses: [],
     anim: [], nodeDrag: null, pointers: new Map(), pinch: null,
-    thought: null, pathIds: new Set(), pathNodeIds: new Set(),
+    thought: null, thoughtId: null, paths: [], pathIndex: 0,
+    pathIds: new Set(), pathNodeIds: new Set(),
+    altIds: new Set(), altNodeIds: new Set(), openIds: new Set(),
+    conflictIds: new Set(), conflictNodeIds: new Set(),
     view: { scale: 1, ox: 0, oy: 0 }, drag: null, press: null, fullscreen: false,
     sessionStart: Date.now(),
   };
   const LAYOUT_FRAMES = 420;
   const LONG_PRESS_MS = 450;
+  // Цвета состояний мысли: жёлтый — выбранный путь, голубой — альтернативы,
+  // зелёный пунктир — открытые звенья, красный — конфликт функционального отношения.
+  const PATH_COLOR = '#ffd36e';
+  const ALT_COLOR = '#7fd8ff';
+  const GHOST_COLOR = '#9fe0b8';
+  const CONFLICT_COLOR = '#ff6b6b';
 
   function typeColor(type) {
     const key = type || 'без типа';
@@ -2487,6 +2496,80 @@
 
   function nodeRadius(degree) {
     return 6 + Math.min(12, Math.sqrt(Math.max(1, degree || 1)) * 2.8);
+  }
+
+  // Phase4+: мысль — не одна цепочка. Старый payload с path=[id,...] тоже поддерживается.
+  function normalizeThoughtPaths(thought) {
+    if (!thought) return [];
+    const raw = Array.isArray(thought.paths) ? thought.paths : [];
+    const paths = raw.filter((p) => p && Array.isArray(p.ids) && p.ids.length)
+      .map((p) => ({
+        ids: p.ids.filter(Boolean),
+        score: Number(p.score) || 0,
+        activation: Number(p.activation) || 0,
+        reason: p.reason || 'path',
+      }));
+    if (paths.length) return paths;
+    const ids = (Array.isArray(thought.path) ? thought.path : [])
+      .map((x) => (typeof x === 'string' ? x : x && x.fact_id)).filter(Boolean);
+    return ids.length ? [{ ids, score: 0, activation: 0, reason: 'primary' }] : [];
+  }
+
+  function applyGraphThought(data, edges) {
+    const thought = data.thought || null;
+    graph.thought = thought;
+    if (!thought || !thought.thought_id) {
+      graph.thoughtId = null;
+      graph.pathIndex = 0;
+    } else if (thought.thought_id !== graph.thoughtId) {
+      graph.thoughtId = thought.thought_id;   // новая мысль — начинаем с основного пути
+      graph.pathIndex = 0;
+    }
+    graph.paths = normalizeThoughtPaths(thought);
+    if (graph.pathIndex >= graph.paths.length) graph.pathIndex = 0;
+
+    const byFact = new Map();
+    for (const e of edges) byFact.set(e.id || e.fact_id, e);
+    const selected = graph.paths[graph.pathIndex] || { ids: [] };
+    graph.pathIds = new Set(selected.ids);
+    graph.pathNodeIds = new Set();
+    for (const fid of selected.ids) {
+      const e = byFact.get(fid);
+      if (e) { graph.pathNodeIds.add(e.a.id); graph.pathNodeIds.add(e.b.id); }
+    }
+
+    graph.altIds = new Set();
+    graph.altNodeIds = new Set();
+    graph.paths.forEach((p, i) => {
+      if (i === graph.pathIndex) return;
+      for (const fid of p.ids) {
+        if (graph.pathIds.has(fid)) continue;
+        graph.altIds.add(fid);
+        const e = byFact.get(fid);
+        if (e) { graph.altNodeIds.add(e.a.id); graph.altNodeIds.add(e.b.id); }
+      }
+    });
+
+    graph.openIds = new Set((thought && thought.open_fact_ids) || []);
+    graph.conflictIds = new Set();
+    graph.conflictNodeIds = new Set();
+    for (const c of ((thought && thought.conflicts) || [])) {
+      for (const fid of (c.fact_ids || [])) {
+        graph.conflictIds.add(fid);
+        const e = byFact.get(fid);
+        if (e) { graph.conflictNodeIds.add(e.a.id); graph.conflictNodeIds.add(e.b.id); }
+      }
+    }
+  }
+
+  function selectGraphPath(index) {
+    if (!graph.paths.length) return;
+    graph.pathIndex = Math.max(0, Math.min(graph.paths.length - 1, index));
+    applyGraphThought({ thought: graph.thought }, graph.edges);
+    renderGraphPaths();
+    renderGraphTrace();
+    renderGraphNotes();
+    kick();
   }
 
   function buildGraph(data) {
@@ -2552,15 +2635,7 @@
     graph.nodes = nodes;
     graph.edges = edges;
     graph.byId = byId;
-    graph.thought = data.thought || null;
-    graph.pathIds = new Set(((data.thought && data.thought.path) || []).filter(Boolean));
-    graph.pathNodeIds = new Set();
-    for (const e of edges) {
-      if (graph.pathIds.has(e.id || e.fact_id)) {
-        graph.pathNodeIds.add(e.a.id);
-        graph.pathNodeIds.add(e.b.id);
-      }
-    }
+    applyGraphThought(data, edges);
     if (changed) {
       graph.temp = hasNew ? Math.max(graph.temp, 1.2) : Math.max(graph.temp, 0.45);
       graph.frames = Math.min(graph.frames, LAYOUT_FRAMES - 120);
@@ -2581,34 +2656,53 @@
     kick();
   }
 
-  // Цепочка/топ импульсов — только из уже пришедших данных графа, без новых полей сервера.
-  function renderGraphTrace(data, edges) {
+  // Переключатель путей Phase4+: первый путь — legacy path, остальные — альтернативы.
+  function renderGraphPaths() {
+    const box = els.graphPaths;
+    if (!box) return;
+    box.textContent = '';
+    if (graph.paths.length < 2) { box.hidden = true; return; }
+    box.hidden = false;
+    box.appendChild(el('span', 'trace-title', 'Пути мысли:'));
+    graph.paths.forEach((p, i) => {
+      const reason = p.reason === 'primary' ? 'основной'
+        : p.reason === 'top_end' ? 'другой конец'
+        : p.reason === 'alternate_parent' ? 'другой родитель' : p.reason;
+      const chip = el('button', 'path-chip' + (i === graph.pathIndex ? ' on' : ''),
+        '#' + (i + 1) + ' ' + reason + ' · ' + p.score.toFixed(3));
+      chip.type = 'button';
+      chip.title = p.ids.join(' → ') + ' · активация ' + p.activation;
+      chip.setAttribute('aria-pressed', i === graph.pathIndex ? 'true' : 'false');
+      chip.addEventListener('click', () => selectGraphPath(i));
+      box.appendChild(chip);
+    });
+  }
+
+  // Цепочка выбранного пути; старый fallback на сильные импульсы сохранён.
+  function renderGraphTrace() {
     const box = els.graphTrace;
     if (!box) return;
     box.textContent = '';
-    const thought = data.thought || null;
     const byFact = new Map();
-    for (const e of edges) byFact.set(e.id || e.fact_id, e);
+    for (const e of graph.edges) byFact.set(e.id || e.fact_id, e);
 
+    const selected = graph.paths[graph.pathIndex];
     const chain = [];
-    if (thought && thought.path && thought.path.length) {
-      for (const fid of thought.path) {
+    if (selected) {
+      for (const fid of selected.ids) {
         const e = byFact.get(fid);
         if (e && !chain.includes(e)) chain.push(e);
       }
     }
     if (!chain.length) {
-      chain.push(...edges.filter((e) => (e.activation || 0) > 0)
+      chain.push(...graph.edges.filter((e) => (e.activation || 0) > 0)
         .sort((a, b) => (b.activation || 0) - (a.activation || 0)).slice(0, 6));
     }
-    if (!chain.length) {
-      box.hidden = true;
-      return;
-    }
+    if (!chain.length) { box.hidden = true; return; }
 
     box.hidden = false;
-    box.appendChild(el('span', 'trace-title',
-      thought && thought.path && thought.path.length ? 'Цепочка мысли:' : 'Сильные импульсы:'));
+    box.appendChild(el('span', 'trace-title', selected && selected.ids.length
+      ? 'Цепочка мысли #' + (graph.pathIndex + 1) + ':' : 'Сильные импульсы:'));
     chain.forEach((e, i) => {
       const chip = el('span', 'trace-chip');
       chip.appendChild(el('span', 'trace-idx', String(i + 1)));
@@ -2619,17 +2713,52 @@
     });
   }
 
+  function renderGraphNotes() {
+    const box = els.graphNotes;
+    if (!box) return;
+    box.textContent = '';
+    const thought = graph.thought || {};
+    const questions = Array.isArray(thought.open_questions) ? thought.open_questions : [];
+    const conflicts = Array.isArray(thought.conflicts) ? thought.conflicts : [];
+    if (!questions.length && !conflicts.length) { box.hidden = true; return; }
+    box.hidden = false;
+    const byFact = new Map();
+    for (const e of graph.edges) byFact.set(e.id || e.fact_id, e);
+    for (const q of questions) {
+      const chip = el('span', 'note-chip question', '? ' + shorten(q, 64));
+      chip.title = String(q);
+      box.appendChild(chip);
+    }
+    for (const c of conflicts) {
+      const targets = (c.fact_ids || []).map((fid) => {
+        const e = byFact.get(fid);
+        return e ? e.b.label : fid;
+      });
+      const chip = el('span', 'note-chip conflict',
+        '⚠ ' + shorten(String(c.s || ''), 24) + ' —' + (c.r || 'связь') + '→ ' +
+        shorten(targets.join(' / '), 48));
+      chip.title = (c.fact_ids || []).join(' · ');
+      box.appendChild(chip);
+    }
+  }
+
   function renderGraphMeta(data, nodes, edges) {
     const totals = data.totals || {};
     const fresh = nodes.filter((n) => n.isNew).length;
     const active = edges.filter((e) => (e.activation || 0) > 0).length;
-    const pathLen = (data.thought && data.thought.path_length) || 0;
+    const thought = data.thought || null;
+    const pathLen = (thought && thought.path_length) || 0;
+    const subgoals = (thought && thought.subgoals) || [];
     els.graphStats.textContent = 'нейронов: ' + nodes.length + ' · связей: ' + edges.length +
       ' · всего фактов: ' + (totals.facts ?? 0) + ' · новых за сессию: ' + fresh +
       (active ? ' · под током: ' + active : '') +
-      (pathLen ? ' · путь мысли: ' + pathLen : '') +
+      (pathLen ? ' · путь мысли: ' + pathLen + '/' + graph.paths.length : '') +
+      (thought && thought.goal ? ' · цель: ' + shorten(thought.goal, 52) : '') +
+      (subgoals.length ? ' · подцели: ' + subgoals.map((s) => shorten(s, 28)).join(' | ') : '') +
       (data.truncated ? ' · показаны свежие связи' : '');
-    renderGraphTrace(data, edges);
+    renderGraphPaths();
+    renderGraphTrace();
+    renderGraphNotes();
     els.graphEmpty.hidden = nodes.length > 0;
 
     els.graphLegend.innerHTML = '';
@@ -2966,11 +3095,18 @@
     const focusedEdges = [];
     const activeLabelEdges = [];
     const pathMode = graph.pathIds.size > 0;
+    const altMode = graph.altIds.size > 0;
+    const ghostMode = graph.openIds.size > 0;
+    const conflictMode = graph.conflictIds.size > 0;
     for (const e of graph.edges) {
+      const fid = e.id || e.fact_id;
       const focus = hi && (e.a === hi || e.b === hi);
-      const onPath = pathMode && graph.pathIds.has(e.id || e.fact_id);
+      const onPath = pathMode && graph.pathIds.has(fid);
+      const isConflict = conflictMode && graph.conflictIds.has(fid) && !onPath;
+      const isAlt = altMode && graph.altIds.has(fid) && !onPath && !isConflict;
+      const isGhost = ghostMode && graph.openIds.has(fid) && !onPath && !isAlt && !isConflict;
       const active = (e.activation || 0) > 0;
-      const inactive = pathMode && !onPath && !focus && !hi && !active;
+      const inactive = pathMode && !onPath && !isAlt && !isGhost && !isConflict && !focus && !hi && !active;
       const pulse = graph.pulses.find((p) => p.edge === e);
       const conf = Math.max(0, Math.min(1, e.weight ?? e.confidence ?? 0.55));
       const imp = Math.max(0, Math.min(1, e.activation || 0));
@@ -2978,25 +3114,39 @@
       if (active && !onPath && !inactive) activeLabelEdges.push(e);
       const c1 = edgeCurve(e);
       ctx.filter = inactive ? 'blur(1.4px)' : 'none';
-      ctx.strokeStyle = focus ? withAlpha(e.color || '#eceef1', 0.9)
-        : onPath ? withAlpha('#ffd36e', 1)
-        : inactive ? withAlpha(e.color || '#9aa3b2', 0.035)
-        : active ? withAlpha(e.color || '#a6bfe0', 0.4 + 0.5 * imp)
-        : withAlpha(e.color || '#9aa3b2', 0.1 + 0.2 * conf);
-      ctx.lineWidth = (focus ? 2.4 : onPath ? 3.4 : active ? 1.6 + 1.2 * imp
-        : inactive ? 0.5 : (0.7 + conf * 0.7)) * inv;
-      if (onPath) {
+      if (isConflict) {
+        ctx.strokeStyle = withAlpha(CONFLICT_COLOR, 0.95);
+        ctx.lineWidth = 2.8 * inv;
+      } else if (onPath) {
+        ctx.strokeStyle = withAlpha(PATH_COLOR, 1);
+        ctx.lineWidth = 3.4 * inv;
+      } else if (isAlt) {
+        ctx.strokeStyle = withAlpha(ALT_COLOR, 0.8);
+        ctx.lineWidth = 2.2 * inv;
+      } else if (isGhost) {
+        ctx.strokeStyle = withAlpha(GHOST_COLOR, 0.45);
+        ctx.lineWidth = 1.4 * inv;
+      } else {
+        ctx.strokeStyle = focus ? withAlpha(e.color || '#eceef1', 0.9)
+          : inactive ? withAlpha(e.color || '#9aa3b2', 0.035)
+          : active ? withAlpha(e.color || '#a6bfe0', 0.4 + 0.5 * imp)
+          : withAlpha(e.color || '#9aa3b2', 0.1 + 0.2 * conf);
+        ctx.lineWidth = (focus ? 2.4 : active ? 1.6 + 1.2 * imp
+          : inactive ? 0.5 : (0.7 + conf * 0.7)) * inv;
+      }
+      if (onPath || isConflict) {
         ctx.save();
-        ctx.strokeStyle = withAlpha('#ffd36e', 0.22);
-        ctx.lineWidth = 10 * inv;
+        ctx.strokeStyle = withAlpha(onPath ? PATH_COLOR : CONFLICT_COLOR, 0.2);
+        ctx.lineWidth = (onPath ? 10 : 8) * inv;
         ctx.beginPath();
         ctx.moveTo(e.a.x, e.a.y);
         ctx.quadraticCurveTo(c1.cx, c1.cy, e.b.x, e.b.y);
         ctx.stroke();
         ctx.restore();
       }
-      if (focus || onPath || active || pulse) {
-        ctx.setLineDash([7 * inv, 8 * inv]);
+      if (focus || onPath || active || pulse || isAlt || isGhost) {
+        ctx.setLineDash(isAlt ? [3 * inv, 5 * inv]
+          : isGhost ? [2 * inv, 6 * inv] : [7 * inv, 8 * inv]);
         ctx.lineDashOffset = -(now / (onPath ? 26 : 40)) * inv;
       } else {
         ctx.setLineDash([]);
@@ -3007,7 +3157,7 @@
       ctx.stroke();
 
       // Направление: стрелка у целевого узла. Без неё связь читается как «просто линия».
-      if ((active || focus) && !inactive) {
+      if ((active || focus || onPath || isAlt || isConflict) && !inactive) {
         const len = Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y) || 1;
         const back = Math.min((e.b.r || 12) + 7 * inv, len * 0.32);
         const t = Math.max(0.55, 1 - back / len);
@@ -3021,7 +3171,9 @@
         ctx.save();
         ctx.translate(px, py);
         ctx.rotate(ang);
-        ctx.fillStyle = onPath ? withAlpha('#ffd36e', 1)
+        ctx.fillStyle = isConflict ? withAlpha(CONFLICT_COLOR, 1)
+          : onPath ? withAlpha(PATH_COLOR, 1)
+          : isAlt ? withAlpha(ALT_COLOR, 0.9)
           : focus ? withAlpha(e.color || '#eceef1', 0.95)
           : withAlpha(e.color || '#a6bfe0', 0.75 + 0.25 * imp);
         ctx.beginPath();
@@ -3038,7 +3190,7 @@
     ctx.filter = 'none';
     ctx.setLineDash([]);
 
-    // Подписи отношений: при наведении + у активных рёбер + у всего пути мысли.
+    // Подписи отношений: при наведении + у активных рёбер + у пути и конфликтов.
     const labeled = new Set();
     if (hi) {
       for (const e of focusedEdges.slice(0, 18)) {
@@ -3054,8 +3206,16 @@
     }
     if (pathMode) {
       for (const e of graph.edges) {
-        if (graph.pathIds.has(e.id || e.fact_id) && !labeled.has(e)) {
-          drawEdgeLabel(ctx, e, inv, '#ffd36e');
+        const fid = e.id || e.fact_id;
+        if (graph.pathIds.has(fid) && !labeled.has(e)) {
+          drawEdgeLabel(ctx, e, inv, PATH_COLOR);
+          labeled.add(e);
+        }
+      }
+      for (const e of graph.edges) {
+        const fid = e.id || e.fact_id;
+        if (graph.conflictIds.has(fid) && !graph.pathIds.has(fid) && !labeled.has(e)) {
+          drawEdgeLabel(ctx, e, inv, CONFLICT_COLOR);
           labeled.add(e);
         }
       }
@@ -3081,19 +3241,38 @@
 
     for (const n of graph.nodes) {
       const onPath = pathMode && graph.pathNodeIds.has(n.id);
+      const altNode = graph.altNodeIds.has(n.id);
+      const conflictNode = graph.conflictNodeIds.has(n.id);
+      const notable = altNode || conflictNode;
       const activeNode = (n.activation || 0) > 0;
       const related = hi && (n === hi || isNeighbor(n, hi) || selIds.has(n.id));
-      const dim = (hi && !related && !activeNode) || (pathMode && !onPath && !hi && !activeNode);
-      const lifted = onPath || activeNode || n === graph.hover || selIds.has(n.id) ||
+      const dim = (hi && !related && !activeNode && !notable) ||
+        (pathMode && !onPath && !hi && !activeNode && !notable);
+      const lifted = onPath || notable || activeNode || n === graph.hover || selIds.has(n.id) ||
         (graph.nodeDrag && graph.nodeDrag.node === n);
-      drawNeuronShape(ctx, n, inv, { dim, lifted, related: related || onPath || activeNode, phase });
+      drawNeuronShape(ctx, n, inv, { dim, lifted, related: related || onPath || notable || activeNode, phase });
 
       if (onPath) {
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 8 * inv, 0, Math.PI * 2);
-        ctx.strokeStyle = withAlpha('#ffd36e', 0.95);
+        ctx.strokeStyle = withAlpha(PATH_COLOR, 0.95);
         ctx.lineWidth = 2.2 * inv;
         ctx.stroke();
+      } else if (conflictNode) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 7 * inv, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(CONFLICT_COLOR, 0.9);
+        ctx.lineWidth = 2 * inv;
+        ctx.stroke();
+      } else if (altNode) {
+        ctx.save();
+        ctx.setLineDash([2 * inv, 4 * inv]);
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r + 5 * inv, 0, Math.PI * 2);
+        ctx.strokeStyle = withAlpha(ALT_COLOR, 0.65);
+        ctx.lineWidth = 1.4 * inv;
+        ctx.stroke();
+        ctx.restore();
       } else if (activeNode) {
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r + 4.5 * inv, 0, Math.PI * 2);
@@ -3137,7 +3316,9 @@
     for (const n of selectedNodes()) if (!candidates.includes(n)) candidates.unshift(n);
     if (pathMode) {
       for (const n of graph.nodes) {
-        if (graph.pathNodeIds.has(n.id) && !candidates.includes(n)) candidates.unshift(n);
+        if ((graph.pathNodeIds.has(n.id) || graph.conflictNodeIds.has(n.id)) && !candidates.includes(n)) {
+          candidates.unshift(n);
+        }
       }
     }
     const hot = graph.nodes.filter((n) => (n.activation || 0) > 0)
@@ -3148,7 +3329,10 @@
     ctx.textBaseline = 'middle';
     for (const n of candidates) {
       const pathNode = pathMode && graph.pathNodeIds.has(n.id);
+      const conflictNode = graph.conflictNodeIds.has(n.id);
+      const altNode = graph.altNodeIds.has(n.id);
       const activeNode = (n.activation || 0) > 0;
+      const notable = pathNode || conflictNode || altNode;
       const text = shorten(n.label, 28);
       const x = n.x + n.r + 7 * inv;
       const y = n.y;
@@ -3156,12 +3340,14 @@
       const h = 14 * inv;
       const box = { x, y: y - h / 2, w, h };
       const hit = labels.some((b) => box.x < b.x + b.w + 6 * inv && box.x + box.w + 6 * inv > b.x && box.y < b.y + b.h + 4 * inv && box.y + box.h + 4 * inv > b.y);
-      if (hit && n !== hi && !selIds.has(n.id) && !pathNode && !activeNode) continue;
+      if (hit && n !== hi && !selIds.has(n.id) && !notable && !activeNode) continue;
       labels.push(box);
-      const dim = (hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id) || activeNode)) ||
-        (pathMode && !pathNode && !hi && !activeNode);
+      const dim = (hi && !(n === hi || isNeighbor(n, hi) || selIds.has(n.id) || notable || activeNode)) ||
+        (pathMode && !notable && !hi && !activeNode);
       ctx.fillStyle = dim ? 'rgba(236,238,241,0.18)'
-        : pathNode ? '#ffd36e'
+        : pathNode ? PATH_COLOR
+        : conflictNode ? CONFLICT_COLOR
+        : altNode ? ALT_COLOR
         : activeNode ? '#dce9ff' : 'rgba(236,238,241,0.95)';
       ctx.fillText(text, x, y);
     }

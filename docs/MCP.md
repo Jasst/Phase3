@@ -118,7 +118,7 @@ Origin — в `MCP_ALLOWED_ORIGINS`. Раздача `/images/` проксиру�
 | `triplex_reflect` | разбор мысли по `thought_id`: все пути, альтернативы, открытые вопросы, обратная связь |
 | `triplex_query` | действующие факты на момент `as_of` |
 | `triplex_facts` | список действующих фактов с полем `agent` (кто записал) |
-| `triplex_graph` | узлы и связи памяти (карта) |
+| `triplex_graph` | узлы и связи памяти (карта); при живом следе мысли — `path`, `paths`, `alternatives`, `subgoals`, `open_fact_ids`, `conflicts` |
 | `triplex_assert` | записать факт; нужны `doc_id` и `span=[start,end]` из `triplex_ingest` |
 | `triplex_supersede` | заменить факт новым; обязательны `valid_from`, `doc_id`, `span` |
 | `triplex_retract` | отозвать (запись остаётся) |

@@ -58,6 +58,38 @@ def test_thought_has_multiple_paths_and_alternatives(tmp_path):
     assert row["subgoals"] and row["paths"] and row["thought_id"] == th["thought_id"]
 
 
+def test_graph_exposes_phase4_paths_without_breaking_legacy(tmp_path):
+    mem, ids, _ = _memory(tmp_path)
+    th = mem.think("Алиса", goal="понять работу и проверить чай", steps=2, scope="web:ui")
+    g = mem.graph(max_edges=50, scope="web:ui")
+    t = g["thought"]
+
+    # Legacy-контракт графа: path — список id, как и до Phase4+.
+    assert t["thought_id"] == th["thought_id"]
+    assert t["path"] == [line["fact_id"] for line in th["path"]]
+    assert t["paths"] and t["paths"][0]["ids"] == t["path"]
+    assert t["subgoals"] == th["subgoals"]
+    assert t["open_fact_ids"] == [] and t["conflicts"] == []
+
+    # Текстовые open_questions проецируются в id только из показанных рёбер.
+    stored = mem._thoughts["web:ui"]["thought"]
+    stored["open_questions"] = ["Алиса работает в Lab"]
+    stored["conflicts"] = [{"s": "Алиса", "r": "работает в",
+                            "fact_ids": [ids["Алиса работает в Lab"]]}]
+    g2 = mem.graph(max_edges=50, scope="web:ui")["thought"]
+    assert g2["open_fact_ids"] == [ids["Алиса работает в Lab"]]
+    assert g2["conflicts"][0]["fact_ids"] == [ids["Алиса работает в Lab"]]
+
+    # Старый след без полей Phase4+ тоже читается.
+    for key in ("paths", "subgoals", "alternatives", "open_questions", "conflicts"):
+        stored.pop(key, None)
+    legacy = mem.graph(max_edges=50, scope="web:ui")["thought"]
+    assert legacy["path"] == t["path"]
+    assert legacy["paths"][0]["ids"] == legacy["path"]
+    assert legacy["subgoals"] == [] and legacy["conflicts"] == []
+    assert legacy["open_fact_ids"] == [] and legacy["open_questions"] == []
+
+
 def test_thought_log_survives_restart_and_filters_by_scope_and_goal(tmp_path):
     mem, _, _ = _memory(tmp_path)
     th = mem.think("Алиса", goal="где работает Алиса", scope="mcp:alice")
