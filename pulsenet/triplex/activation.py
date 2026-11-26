@@ -59,6 +59,12 @@ class Thought:
     parents: Dict[str, str] = field(default_factory=dict)
     path: List[str] = field(default_factory=list)
     steps: List[dict] = field(default_factory=list)
+    # Phase4+: путь больше не один. Остальные поля проецируются в ThoughtState.
+    paths: List[dict] = field(default_factory=list)
+    alternatives: List[dict] = field(default_factory=list)
+    open_questions: List[str] = field(default_factory=list)
+    conflicts: List[dict] = field(default_factory=list)
+    beam: int = 1
 
     def to_dict(self, mem=None, limit: int = 20) -> dict:
         def line(fid: str) -> dict:
@@ -82,6 +88,10 @@ class Thought:
             "facts": [line(fid) for fid, _ in ranked],
             "activation": {fid: round(a, 4) for fid, a in ranked},
             "path_length": len(self.path),
+            "paths": self.paths,
+            "alternatives": self.alternatives,
+            "open_questions": self.open_questions,
+            "conflicts": self.conflicts,
         }
 
 
@@ -93,13 +103,24 @@ def _dot(a, b) -> float:
 
 
 def availability(mem, f: Fact, t) -> float:
-    """Эпистемический фильтр: можно ли сейчас влиять этим фактом на вывод."""
+    """Эпистемический фильтр: можно ли сейчас влиять этим фактом на вывод.
+
+    Помимо confidence учитываются структурированные verdict'ы Phase4+:
+    спорный факт, штраф отношения и надёжность источника. Сам журнал при этом
+    не меняется — это оценочный слой поверх него.
+    """
     if f.retracted or f.invalid_at is not None:
         return 0.0
     if mem.is_archived(f, t):
         return 0.0
     rel = mem.relations.get(f.r, {})
     prior = 0.55 if rel.get("proposed") else 1.0
+    prior *= max(0.25, 1.0 - float(rel.get("penalty") or 0.0))
+    if f.fact_id in getattr(mem, "_disputed", ()):
+        prior *= 0.5
+    doc_id = f.source.get("doc_id")
+    if doc_id:
+        prior *= max(0.3, 1.0 - float(getattr(mem, "_source_penalty", {}).get(doc_id, 0.0)))
     return prior * (0.6 + 0.4 * f.confidence)
 
 
@@ -132,13 +153,120 @@ def edge_weight(mem, f: Fact, t, fact_cos: float = 0.0) -> float:
 
 
 def _relation_vectors(mem, cue_vec) -> Dict[str, float]:
-    """Косинус отношения с текущим намерением; кэшируется на вызов run()."""
-    if cue_vec is None:
+    """Косинус отношения с намерением; несколько подцелей дают максимум, а не среднее.
+
+    ``cue_vec`` — один вектор (старый вызов) или список векторов подцелей.
+    Максимум сохраняет направление каждой подцели: размытое среднее превращало
+    «понять X и проверить Y» в нечёткий кью, который не менял путь.
+    """
+    vecs = cue_vec if isinstance(cue_vec, (list, tuple)) else [cue_vec]
+    vecs = [v for v in vecs if v is not None]
+    if not vecs:
         return {}
     out: Dict[str, float] = {}
     for name in mem.relations:
         vec = mem.encoder.embed([name])[0]
-        out[name] = max(0.0, min(1.0, _dot(vec, cue_vec)))
+        out[name] = max(0.0, min(1.0, max(_dot(vec, cv) for cv in vecs)))
+    return out
+
+
+def _reconstruct(parents: Dict[str, str], end: str) -> List[str]:
+    """Восстановить путь от seed до конца по карте родителей."""
+    path: List[str] = []
+    cur, seen = end, set()
+    while cur and cur not in seen:
+        seen.add(cur)
+        path.append(cur)
+        cur = parents.get(cur)
+    path.reverse()
+    return path
+
+
+def _path_score(ids: List[str], act: Dict[str, float], rmatch: Dict[str, float],
+                by_id: Dict[str, Fact]) -> float:
+    """Оценка траектории: активация × соответствие отношений цели."""
+    if not ids:
+        return 0.0
+    base = sum(act.get(fid, 0.0) for fid in ids) / len(ids)
+    match = sum(rmatch.get(by_id[fid].r, 0.0) for fid in ids if fid in by_id) / len(ids)
+    return round(base * (0.6 + 0.4 * match), 6)
+
+
+def _alternatives(act: Dict[str, float], parents: Dict[str, str],
+                  parent_candidates: Dict[str, List[str]], primary: List[str],
+                  rmatch: Dict[str, float], by_id: Dict[str, Fact],
+                  beam: int, mem, t) -> Tuple[List[dict], List[dict], List[str]]:
+    """Несколько путей вместо одного: разные концы и альтернативные родители.
+
+    ``primary`` (старый путь) всегда остаётся первым — интерфейс и обратная
+    связь продолжают работать с тем же контрактом. Остальные траектории
+    собираются из вторых best-родителей и соседних по активации концов,
+    поэтому они реально существуют в графе, а не выдуманы.
+    """
+    scored: Dict[Tuple[str, ...], dict] = {}
+
+    def add(ids: List[str], reason: str) -> None:
+        if len(ids) < 2:
+            return
+        key = tuple(ids)
+        if key in scored:
+            return
+        scored[key] = {
+            "ids": list(ids),
+            "score": _path_score(ids, act, rmatch, by_id),
+            "reason": reason,
+            "activation": round(act.get(ids[-1], 0.0), 4),
+        }
+
+    add(primary, "primary")
+    ends = sorted(act, key=lambda fid: (-act[fid], fid))[:max(2, min(beam + 1, 8))]
+    for end in ends:
+        add(_reconstruct(parents, end), "top_end")
+    for fid, options in parent_candidates.items():
+        if fid not in parents or len(options) < 2:
+            continue
+        alt = dict(parents)
+        alt[fid] = options[1]
+        for end in ends[:2]:
+            ids = _reconstruct(alt, end)
+            if set(ids) != set(primary) or ids != primary:
+                add(ids, "alternate_parent")
+
+    ordered = sorted(scored.values(), key=lambda p: (-p["score"], p["ids"]))
+    # primary остаётся первым даже если его оценки чуть ниже — это обратная совместимость.
+    prim_key = tuple(primary)
+    ordered.sort(key=lambda p: 0 if tuple(p["ids"]) == prim_key else 1)
+    paths = ordered[:max(1, min(beam + 1, 6))]
+    alternatives = paths[1:]
+
+    # Открытые вопросы: звенья, которые были кандидатами, но не попали в бюджет.
+    questions: List[str] = []
+    active = set(act)
+    for fid, options in parent_candidates.items():
+        for other in options[2:]:
+            if other in active or other in questions:
+                continue
+            f = by_id.get(other)
+            if f is not None and len(questions) < 8:
+                questions.append(mem._fact_text(f))
+    return paths, alternatives, questions
+
+
+def _conflicts(mem, act: Dict[str, float], by_id: Dict[str, Fact]) -> List[dict]:
+    """Активные функциональные факты с разными объектами — сигнал, а не тихий выбор."""
+    groups: Dict[Tuple[str, str], List[str]] = {}
+    for fid in act:
+        f = by_id.get(fid)
+        if f is None:
+            continue
+        rel = mem.relations.get(f.r, {})
+        if not (rel.get("functional") or f.functional):
+            continue
+        groups.setdefault((f.s, f.r), []).append(fid)
+    out = []
+    for (s, r), ids in sorted(groups.items()):
+        if len({by_id[i].o for i in ids}) > 1:
+            out.append({"s": s, "r": r, "fact_ids": sorted(ids)})
     return out
 
 
@@ -150,20 +278,32 @@ def _trim(act: Dict[str, float], top_k: int, threshold: float) -> Dict[str, floa
 
 def run(mem, seeds: Sequence[str], live: Sequence[Fact], by_id: Dict[str, Fact],
         qv, cue_vec, t, query: str, goal: str = "", steps: int = ACT_STEPS,
-        top_k: int = ACT_TOP_K, fanout: int = ACT_FANOUT) -> Thought:
-    """Прогнать импульс по графу и собрать Thought."""
-    thought = Thought(query=query, goal=goal or "")
+        top_k: int = ACT_TOP_K, fanout: int = ACT_FANOUT, beam: int = 1) -> Thought:
+    """Прогнать импульс по графу и собрать Thought.
+
+    ``beam`` управляет числом возвращаемых траекторий; основной путь и фронт
+    активации остаются прежними, поэтому старые клиенты не ломаются.
+    """
+    thought = Thought(query=query, goal=goal or "", beam=max(1, min(int(beam or 1), 6)))
     if not seeds:
         return thought
 
     adj = mem._adjacency(list(live))
     rmatch = _relation_vectors(mem, cue_vec)
+    cues = cue_vec if isinstance(cue_vec, (list, tuple)) else [cue_vec]
+    cues = [c for c in cues if c is not None] or [qv]
+
+    def cue_cos(fid: str) -> float:
+        """Косинус с запросом ИЛИ с любой подцелью: goal меняет вес seed-фактов."""
+        return max([max(0.0, mem._fact_cos(fid, qv))]
+                   + [max(0.0, mem._fact_cos(fid, c)) for c in cues])
+
     act: Dict[str, float] = {}
     for fid in seeds:
         f = by_id.get(fid)
         if f is None:
             continue
-        cos = max(0.0, mem._fact_cos(fid, qv))
+        cos = cue_cos(fid)
         a = edge_weight(mem, f, t, cos) * availability(mem, f, t)
         if a > 0:
             act[fid] = a
@@ -171,6 +311,7 @@ def run(mem, seeds: Sequence[str], live: Sequence[Fact], by_id: Dict[str, Fact],
     if not act:
         return thought
 
+    parent_candidates: Dict[str, List[Tuple[float, str]]] = {}
     for step in range(max(1, min(int(steps), 8))):
         incoming: Dict[str, float] = {}
         parents: Dict[str, Tuple[float, str]] = {}
@@ -193,7 +334,7 @@ def run(mem, seeds: Sequence[str], live: Sequence[Fact], by_id: Dict[str, Fact],
                     other = nf.o if nf.s == ent else nf.s
                     if other == ent:                     # петлю не распространяем
                         continue
-                    cos = max(0.0, mem._fact_cos(nid, qv))
+                    cos = cue_cos(nid)
                     w = edge_weight(mem, nf, t, cos) * availability(mem, nf, t)
                     if w <= 0:
                         continue
@@ -206,6 +347,9 @@ def run(mem, seeds: Sequence[str], live: Sequence[Fact], by_id: Dict[str, Fact],
                     incoming[nid] = incoming.get(nid, 0.0) + contrib
                     if nid not in parents or contrib > parents[nid][0]:
                         parents[nid] = (contrib, fid)
+                    if fid != nid:
+                        # запасные родители — основа альтернативных путей Phase4+.
+                        parent_candidates.setdefault(nid, []).append((contrib, fid))
 
         nxt: Dict[str, float] = {}
         for fid, a in incoming.items():
@@ -233,15 +377,22 @@ def run(mem, seeds: Sequence[str], live: Sequence[Fact], by_id: Dict[str, Fact],
         return thought
 
     end = sorted(act.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-    path: List[str] = []
-    cur, seen = end, set()
-    while cur and cur not in seen:
-        seen.add(cur)
-        path.append(cur)
-        cur = thought.parents.get(cur)
-    path.reverse()
+    path = _reconstruct(thought.parents, end)
     thought.path = path
-    thought.status = "ok"
+
+    # Альтернативные траектории и открытые звенья — новая часть Phase4+.
+    ranked_parents: Dict[str, List[str]] = {}
+    for nid, options in parent_candidates.items():
+        seen_p, uniq = set(), []
+        for _, parent in sorted(options, key=lambda x: (-x[0], x[1])):
+            if parent not in seen_p:
+                seen_p.add(parent)
+                uniq.append(parent)
+        ranked_parents[nid] = uniq[:4]
+    thought.paths, thought.alternatives, thought.open_questions = _alternatives(
+        act, thought.parents, ranked_parents, path, rmatch, by_id, thought.beam, mem, t)
+    thought.conflicts = _conflicts(mem, act, by_id)
+    thought.status = "conflict" if thought.conflicts else "ok"
     return thought
 
 

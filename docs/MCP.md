@@ -97,14 +97,14 @@ project-local (`opencode.json(c)` / `.opencode/opencode.json(c)`). В этом �
 Заголовок `Authorization` не сбрасывается. Домен добавьте в `MCP_ALLOWED_HOSTS`, при необходимости
 Origin — в `MCP_ALLOWED_ORIGINS`. Раздача `/images/` проксируется отдельно.
 
-**Проверка.** Вызов `tools/list` с токеном должен вернуть 31 инструмент:
+**Проверка.** Вызов `tools/list` с токеном должен вернуть 33 инструмента:
 
     curl -s -X POST http://127.0.0.1:8010/mcp \
       -H "Authorization: Bearer <токен>" -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
       -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
-## Инструменты (31)
+## Инструменты (33)
 
 **Память (`triplex_*`)**
 
@@ -112,8 +112,10 @@ Origin — в `MCP_ALLOWED_ORIGINS`. Раздача `/images/` проксиру�
 |---|---|
 | `triplex_ingest` | сохранить текст как документ и извлечь факты; возвращает `doc_id` |
 | `triplex_search` | гибридный поиск; возвращает факты, фрагменты и готовый `context` |
-| `triplex_think` | пустить импульс по графу; возвращает путь мысли и `thought_id` |
-| `triplex_feedback` | подкрепить/ослабить путь: `fact_ids` из `thought.path`, `valence`, `thought_id` из `triplex_think` |
+| `triplex_think` | пустить импульс по графу; возвращает `path`, `paths`, `alternatives`, `open_questions`, `thought_id`; есть `parent_thought_id` |
+| `triplex_feedback` | подкрепить/ослабить путь: `fact_ids` из `thought.path`, `valence`, `thought_id`; или `verdicts=[{fact_id, valence, reason}]` + `outcome` |
+| `triplex_thoughts` | история мыслей: `limit`, фильтр `goal`; мысли переживают перезапуск |
+| `triplex_reflect` | разбор мысли по `thought_id`: все пути, альтернативы, открытые вопросы, обратная связь |
 | `triplex_query` | действующие факты на момент `as_of` |
 | `triplex_facts` | список действующих фактов с полем `agent` (кто записал) |
 | `triplex_graph` | узлы и связи памяти (карта) |

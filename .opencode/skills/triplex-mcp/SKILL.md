@@ -1,6 +1,6 @@
 ---
 name: Triplex MCP
-description: Работа с памятью ТРИПЛЕКСИЯ, фазой 4 (triplex_think/triplex_feedback), веб-поиском, чтением кода и image_generate через MCP pulsenet-unified. Используйте для фактов из прошлых сессий, поиска, картинок и диагностики самого MCP.
+description: Работа с памятью ТРИПЛЕКСИЯ, фазой 4+ (triplex_think/triplex_feedback/triplex_thoughts/triplex_reflect), веб-поиском, чтением кода и image_generate через MCP pulsenet-unified. Используйте для фактов из прошлых сессий, поиска, картинок и диагностики самого MCP.
 ---
 
 # Triplex MCP (Phase3)
@@ -12,7 +12,7 @@ description: Работа с памятью ТРИПЛЕКСИЯ, фазой 4 (
 ## Рабочий порядок
 
 1. Перед нетривиальной задачей: `triplex_search({ query, k?, goal?, as_of? })`. Если вернулись факты или `context`, скажите, что опираетесь на память.
-2. Для проверки гипотезы/пути: `triplex_think({ query, goal?, k?, steps?, as_of? })`. Если мысль подтвердилась или опроверглась: `triplex_feedback({ fact_ids: thought.path, valence, thought_id })` — `thought_id` берите из результата `triplex_think`, чужие id не принимаются.
+2. Для проверки гипотезы/пути: `triplex_think({ query, goal?, k?, steps?, as_of?, parent_thought_id? })` — вернёт `path`, `paths`, `alternatives`, `open_questions`, `thought_id`. Если мысль подтвердилась или опроверглась: `triplex_feedback({ fact_ids: [fact_id из thought.path], valence, thought_id })`; для оценок по звеньям — `verdicts: [{fact_id, valence, reason}]` и `outcome`. `thought_id` берите из результата `triplex_think`, чужие id не принимаются. Историю/разбор: `triplex_thoughts`, `triplex_reflect`.
 3. После подтверждённого решения: `triplex_ingest({ text, session_id?, role?, model?, recorded_at? })` → `doc_id`, затем `triplex_assert({ s, r, o, doc_id, span })`.
 4. Устаревший факт: `triplex_supersede({ old_fact_id, s, r, o, valid_from, doc_id, span })` или `triplex_retract({ fact_id })`.
 5. `triplex_confirm({ fact_id, yes })` только меняет уверенность уже записанного факта. Это не способ пометить догадку.
@@ -22,8 +22,9 @@ description: Работа с памятью ТРИПЛЕКСИЯ, фазой 4 (
 | Инструмент | Обязательное и важные опции |
 |---|---|
 | `triplex_search` | `query`; `k` 1–50, `goal`, `as_of`, `include_archived`, `activate`, `remember_thought` |
-| `triplex_think` | `query`; `goal`, `k=8`, `steps=3` (1–8), `as_of` |
-| `triplex_feedback` | `fact_ids` (из `thought.path`), `valence` от -1 до 1, `thought_id` из `triplex_think` |
+| `triplex_think` | `query`; `goal`, `k=8`, `steps=3` (1–8), `as_of`, `parent_thought_id`, `adaptive=true` |
+| `triplex_feedback` | `fact_ids` (fact_id из `thought.path`), `valence` от -1 до 1, `thought_id`; либо `verdicts=[{fact_id, valence, reason}]`, `overall_valence`, `outcome` |
+| `triplex_thoughts`, `triplex_reflect` | `limit=20`, `goal` / `thought_id`; история мыслей живёт после перезапуска |
 | `triplex_ingest` | `text`; `session_id`, `role=user`, `model`, `recorded_at` |
 | `triplex_assert` | `s`, `r`, `o`, `doc_id`, `span: [start, end]` — ровно два целых индекса в тексте документа |
 | `triplex_supersede` | `old_fact_id`, `s`, `r`, `o`, `valid_from` (ISO 8601), `doc_id`, `span` |
@@ -38,7 +39,7 @@ description: Работа с памятью ТРИПЛЕКСИЯ, фазой 4 (
 | `code_list/read/search` | обязательный `root` из `CODE_ROOTS`; `subdir`, `path` + `start/end`, `pattern`; доступ только для `CODE_ACCESS_USERS` |
 | `activity_recent` | `limit=30`; `pulsenet_guide`, `whoami` — без аргументов |
 
-Полная таблица на 31 инструмент — в `references/tool-signatures.md`.
+Полная таблица на 33 инструмента — в `references/tool-signatures.md`.
 
 ## Память и безопасность
 

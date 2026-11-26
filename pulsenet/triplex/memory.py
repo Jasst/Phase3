@@ -32,6 +32,7 @@ from .docstore import DocStore
 from .encoder import HashEncoder
 from .index import LSHIndex, VectorIndex, rrf
 from .journal import ConflictError, Fact, FactJournal
+from .thoughts import ThoughtLog, ThoughtState, plan_budget, split_goal
 
 LINK_HI = 0.85       # A2: cos ≥ 0.85 → link
 LINK_LO = 0.70       # A2: 0.70 ≤ cos < 0.85 → link с conf×0.7
@@ -89,6 +90,11 @@ class TriplexMemory:
         self.docs = DocStore(os.path.join(root, "docs.jsonl"), chunk_chars=chunk_chars)
         self.journal = FactJournal(os.path.join(root, "journal.jsonl"))
         self._meta_path = os.path.join(root, "meta.jsonl")
+        # Phase4+: журнал мыслей и оценочные штрафы от структурированной обратной связи.
+        # Штрафы живут в meta.jsonl и поэтому переживают перезапуск вместе с boost.
+        self.thoughts = ThoughtLog(os.path.join(root, "thoughts.jsonl"))
+        self._source_penalty: Dict[str, float] = {}
+        self._disputed: set = set()
 
         self.entities: Dict[str, dict] = {}       # entity_id -> {canonical, type, aliases}
         self._alias_to_entity: Dict[str, str] = {}
@@ -134,12 +140,23 @@ class TriplexMemory:
             self._alias_to_entity.setdefault(rec["alias"].lower(), rec["entity_id"])
         elif rec["op"] == "relation":
             canon = rec["canonical"]
+            old = self.relations.get(canon, {})
             self.relations[canon] = {"aliases": list(rec.get("aliases", [])),
                                      "functional": bool(rec.get("functional", False)),
                                      "tau_days": rec.get("tau_days"),
-                                     "proposed": bool(rec.get("proposed", False))}
+                                     "proposed": bool(rec.get("proposed", False)),
+                                     "penalty": float(old.get("penalty") or rec.get("penalty") or 0.0)}
             for a in [canon] + self.relations[canon]["aliases"]:
                 self._rel_alias[a.lower()] = canon
+        elif rec["op"] == "relation_penalty":
+            name = rec["relation"]
+            rel = self.relations.setdefault(name, {"aliases": [], "functional": False,
+                                                   "tau_days": None, "proposed": True})
+            rel["penalty"] = max(0.0, min(0.6, float(rec.get("value") or 0.0)))
+        elif rec["op"] == "source_penalty":
+            self._source_penalty[str(rec["doc_id"])] = max(0.0, min(0.6, float(rec.get("value") or 0.0)))
+        elif rec["op"] == "disputed":
+            self._disputed.add(str(rec["fact_id"]))
         else:
             raise ValueError(f"неизвестная meta-операция {rec['op']!r}")
 
@@ -393,7 +410,8 @@ class TriplexMemory:
                coarse: int = 24, depth: int = 2, include_archived: bool = False,
                budget_facts_chars: int = 3200, budget_chunks_chars: int = 1600,
                activate: bool = False, goal: str = "", steps: int = 3,
-               scope: str = "", remember_thought: bool = True) -> dict:
+               scope: str = "", remember_thought: bool = True, adaptive: bool = True,
+               parent_thought_id: Optional[str] = None) -> dict:
         with self._lock:
             as_of = as_of or _now()
             t = _dt(as_of)
@@ -404,17 +422,46 @@ class TriplexMemory:
             by_id = {f.fact_id: f for f in live}
             allowed = set(by_id)
 
+            # Phase4+: цель разлагается на подцели и участвует уже в отборе seeds.
+            subs = split_goal(goal) if adaptive and activate else []
+            budget = plan_budget(len(live), goal, k_facts, steps) if adaptive and activate else {
+                "steps": steps, "top_k": max(coarse, k_facts * 2), "fanout": 4,
+                "beam": 1, "subgoals": []}
+            if subs:
+                # Чистые кью подцелей: если смешать их с query, цель перестаёт
+                # различать факты, одинаково близкие к самому вопросу.
+                cue_vecs = [self.encoder.embed_query([s])[0] for s in subs]
+            else:
+                cue_vecs = [qv]
+
             # Stage 1: coarse
             seeds: List[str] = []
             if allowed:
                 fl = self.fact_lsh.topk(qv, 64, allowed)
                 ff = [k for k, _ in self.fact_index.topk(qv, 64, allowed)]
-                seeds = [k for k, _ in rrf([fl, ff])][:coarse]
-                # порог релевантности для стартовых фактов; граф расширяем только от релевантных
+                seed_rank = [k for k, _ in rrf([fl, ff])]
+                if subs:
+                    # каждая подцель добавляет своих кандидатов, а не только переранжирует
+                    for cv in cue_vecs:
+                        gl = self.fact_lsh.topk(cv, 32, allowed)
+                        gf = [k for k, _ in self.fact_index.topk(cv, 32, allowed)]
+                        seed_rank.extend(k for k, _ in rrf([gl, gf])[:24])
+                seeds = list(dict.fromkeys(seed_rank))[:coarse]
+                # порог релевантности: запрос ИЛИ любая подцель. Goal расширяет,
+                # но не вытесняет запрос — старые вызовы без goal ведут себя как раньше.
                 qtok = set(_tokens(query))
-                seeds = [fid for fid in seeds
-                         if self._relevant(self._fact_cos(fid, qv),
-                                           set(_tokens(self._fact_text(by_id[fid]))), qtok)]
+                gtok = set(_tokens(" ".join(subs))) if subs else set()
+                kept = []
+                for fid in seeds:
+                    ftok = set(_tokens(self._fact_text(by_id[fid])))
+                    cos = self._fact_cos(fid, qv)
+                    if self._relevant(cos, ftok, qtok):
+                        kept.append(fid)
+                    elif gtok and self._relevant(
+                            max([cos] + [self._fact_cos(fid, cv) for cv in cue_vecs]),
+                            ftok, gtok):
+                        kept.append(fid)
+                seeds = kept
             chunk_rank = [k for k, _ in self.chunk_index.topk(qv, coarse)]
 
             # Stage 2: expand. Phase4 — активационный поток вместо плоского BFS.
@@ -422,19 +469,22 @@ class TriplexMemory:
             thought: Optional[activation_layer.Thought] = None
             thought_meta: Optional[dict] = None
             if activate and seeds:
-                cue_text = " ".join(x for x in (query, goal or "") if x).strip()
-                cue_vec = self.encoder.embed_query([cue_text])[0]
                 thought = activation_layer.run(
-                    self, seeds, live, by_id, qv, cue_vec, t, query, goal=goal,
-                    steps=steps, top_k=max(coarse, k_facts * 2),
+                    self, seeds, live, by_id, qv, cue_vecs,
+                    t, query, goal=goal, steps=budget["steps"], top_k=budget["top_k"],
+                    fanout=budget["fanout"], beam=budget["beam"],
                 )
                 path_w = dict(thought.activation)
                 candidates = list(dict.fromkeys(
                     seeds + thought.path + [fid for fid in path_w if fid not in seeds]
                 ))
-                thought_meta = thought.to_dict(self)
+                tid = uuid.uuid4().hex[:12] if remember_thought else ""
+                state = ThoughtState.from_thought(
+                    thought, thought_id=tid, scope=scope,
+                    parent_thought_id=parent_thought_id, subgoals=subs)
+                thought_meta = state.to_dict(self)
                 if remember_thought:
-                    thought_meta["thought_id"] = uuid.uuid4().hex[:12]
+                    self.thoughts.append(state)
                     self._thoughts[scope] = {"thought": thought_meta, "at": time.monotonic()}
             else:
                 adj = self._adjacency(live)
@@ -536,55 +586,144 @@ class TriplexMemory:
     # ---------- Phase4: мысль и валентность ----------
 
     def think(self, query: str, goal: str = "", as_of: Optional[str] = None,
-              k: int = 8, steps: int = 3, scope: str = "") -> dict:
+              k: int = 8, steps: int = 3, scope: str = "",
+              parent_thought_id: Optional[str] = None, adaptive: bool = True) -> dict:
         """Запустить активационный поток и вернуть Thought (а не просто top-k фактов)."""
         r = self.recall(query, as_of=as_of, k_facts=k, activate=True, goal=goal,
-                        steps=steps, scope=scope)
+                        steps=steps, scope=scope, parent_thought_id=parent_thought_id,
+                        adaptive=adaptive)
         return r["thought"] or {"status": "empty", "query": query, "goal": goal,
-                                "steps": [], "path": [], "facts": [], "activation": {}}
+                                "steps": [], "path": [], "facts": [], "activation": {},
+                                "paths": [], "alternatives": [], "open_questions": [],
+                                "conflicts": []}
 
-    def feedback(self, fact_ids: List[str], valence: float, thought_id: Optional[str] = None,
-                 scope: Optional[str] = None) -> dict:
-        """Обратное кредитование по пути мысли: valence ∈ [-1, 1].
+    # Причины структурированных verdict'ов и их вклад в подкрепление.
+    _VERDICT_SCALE = {
+        "good": 1.0, "irrelevant": 1.0, "outdated": 0.5,
+        "wrong_relation": 0.5, "missing_link": 0.3, "contradiction": 1.0,
+    }
 
-        Если передан scope (MCP/интерфейс), факты должны принадлежать сохранённой
-        мысли — иначе агент мог бы подкрепить произвольный факт. Локальные вызовы
-        без scope сохраняют старое поведение для регрессий и тестов.
+    def feedback(self, fact_ids: Optional[List[str]] = None, valence: Optional[float] = None,
+                 thought_id: Optional[str] = None, scope: Optional[str] = None,
+                 verdicts: Optional[List[dict]] = None,
+                 overall_valence: Optional[float] = None, outcome: str = "") -> dict:
+        """Обратное кредитование мысли. Старый вызов (fact_ids, valence) работает как раньше.
+
+        Phase4+ добавляет структурированные verdict'ы: для каждого факта можно
+        указать свою валентность и причину. Причины влияют не только на boost,
+        но и наprior отношения/надёжность источника/флаг спорного факта.
+        Если передан scope (MCP/интерфейс), все факты должны принадлежать хотя
+        бы одному пути мысли — произвольный id по-прежнему отвергается.
         """
-        ids = [str(i) for i in (fact_ids or [])]
-        if scope is not None:
-            thought, err = self._feedback_thought(ids, thought_id, scope)
-            if err:
-                return {"status": "rejected", "message": err}
-        updates = activation_layer.apply_valence(self, ids, valence)
-        return {"status": "ok", "updates": [{"fact_id": fid, "amount": a} for fid, a in updates]}
+        with self._lock:
+            ids = [str(i) for i in (fact_ids or [])]
+            v = valence if valence is not None else overall_valence
+            items: List[dict] = []
+            for verdict in verdicts or []:
+                if not isinstance(verdict, dict):
+                    return {"status": "rejected", "message": "verdicts: ожидается список объектов"}
+                fid = str(verdict.get("fact_id") or "")
+                try:
+                    vv = float(verdict.get("valence", v if v is not None else 0.0))
+                except (TypeError, ValueError):
+                    return {"status": "rejected", "message": "verdicts: неверная valence"}
+                reason = str(verdict.get("reason") or "good")
+                if reason not in self._VERDICT_SCALE:
+                    return {"status": "rejected", "message": f"неизвестная причина: {reason}"}
+                items.append({"fact_id": fid, "valence": max(-1.0, min(1.0, vv)), "reason": reason})
+                ids.append(fid)
+            ids = list(dict.fromkeys(ids))
+            if not ids and not items:
+                return {"status": "rejected", "message": "нужны fact_ids или verdicts"}
+            if v is None and not items:
+                return {"status": "rejected", "message": "нужна valence или overall_valence"}
+
+            thought = None
+            if scope is not None:
+                thought, err = self._feedback_thought(ids, thought_id, scope)
+                if err:
+                    return {"status": "rejected", "message": err}
+
+            updates: List[Tuple[str, float]] = []
+            if items:
+                for item in items:
+                    fid = item["fact_id"]
+                    amount = item["valence"] * self._VERDICT_SCALE[item["reason"]]
+                    updates.extend(activation_layer.apply_valence(
+                        self, [fid], amount, at=thought.get("as_of") if thought else None))
+                    self._apply_verdict(fid, item["reason"])
+            else:
+                updates = activation_layer.apply_valence(self, ids, float(v or 0.0))
+
+            tid = (thought or {}).get("thought_id") or thought_id or ""
+            if tid and scope is not None:
+                self.thoughts.event(tid, "feedback", outcome=outcome or "ok", verdicts=items,
+                                    overall_valence=v)
+            return {
+                "status": "ok",
+                "updates": [{"fact_id": fid, "amount": a} for fid, a in updates],
+                "thought_id": tid,
+                "outcome": outcome or "ok",
+                "verdicts": items,
+            }
+
+    def _apply_verdict(self, fact_id: str, reason: str) -> None:
+        """Записать оценочный штраф в meta.jsonl (не в журнал фактов)."""
+        f = self.journal.facts.get(fact_id)
+        if f is None:
+            return
+        if reason == "wrong_relation":
+            name = self._rel_alias.get(f.r.lower(), f.r)
+            rel = self.relations.get(name, {})
+            old = float(rel.get("penalty") or 0.0)
+            self._write_meta({"op": "relation_penalty", "relation": name,
+                              "value": round(min(0.6, old + 0.05), 4)})
+            self._apply_meta({"op": "relation_penalty", "relation": name,
+                              "value": round(min(0.6, old + 0.05), 4)})
+        elif reason == "outdated":
+            doc_id = f.source.get("doc_id")
+            if doc_id:
+                old = self._source_penalty.get(doc_id, 0.0)
+                value = round(min(0.6, old + 0.05), 4)
+                self._write_meta({"op": "source_penalty", "doc_id": doc_id, "value": value})
+                self._apply_meta({"op": "source_penalty", "doc_id": doc_id, "value": value})
+        elif reason == "contradiction" and fact_id not in self._disputed:
+            self._write_meta({"op": "disputed", "fact_id": fact_id})
+            self._apply_meta({"op": "disputed", "fact_id": fact_id})
 
     def _feedback_thought(self, fact_ids: List[str], thought_id: Optional[str],
                           scope: str) -> Tuple[Optional[dict], str]:
         """Найти мысль по id (или последнюю в scope) и проверить, что факты из неё."""
-        entry, entry_key = None, scope
-        if thought_id:
-            for key, e in self._thoughts.items():
-                if e["thought"].get("thought_id") == thought_id:
-                    entry, entry_key = e, key
-                    break
-            if entry is None:
-                return None, "мысль с таким thought_id не найдена или уже угасла"
-        else:
-            entry = self._thoughts.get(scope)
-            if entry is None:
-                return None, "нет мысли: сначала вызовите think() или search(activate=True)"
-        thought, _ = self._decay_thought(entry)
-        if thought is None:
-            self._thoughts.pop(entry_key, None)
-            return None, "мысль угасла: пустите импульс заново"
-        allowed = {line["fact_id"] for line in (thought.get("path") or [])
-                   if isinstance(line, dict) and line.get("fact_id")}
-        allowed.update((thought.get("activation") or {}).keys())
-        extra = [fid for fid in fact_ids if fid not in allowed]
-        if extra:
-            return None, "факты не из этой мысли: " + ", ".join(extra[:5])
-        return thought, ""
+        with self._lock:
+            entry, entry_key = None, scope
+            if thought_id:
+                for key, e in self._thoughts.items():
+                    if e["thought"].get("thought_id") == thought_id:
+                        entry, entry_key = e, key
+                        break
+                if entry is None:
+                    # мысль угасла в графе, но осталась в журнале мыслей
+                    logged = self.thoughts.get(thought_id)
+                    if logged is not None and (not logged.get("scope") or logged["scope"] == scope):
+                        return logged, ""
+                    return None, "мысль с таким thought_id не найдена"
+            else:
+                entry = self._thoughts.get(scope)
+                if entry is None:
+                    return None, "нет мысли: сначала вызовите think() или search(activate=True)"
+            thought, _ = self._decay_thought(entry)
+            if thought is None:
+                self._thoughts.pop(entry_key, None)
+                return None, "мысль угасла: пустите импульс заново"
+            allowed = {line["fact_id"] for line in (thought.get("path") or [])
+                       if isinstance(line, dict) and line.get("fact_id")}
+            allowed.update((thought.get("activation") or {}).keys())
+            for p in thought.get("paths") or []:
+                allowed.update(p.get("ids") or [])
+            extra = [fid for fid in fact_ids if fid not in allowed]
+            if extra:
+                return None, "факты не из этой мысли: " + ", ".join(extra[:5])
+            return thought, ""
 
     def _adjacency(self, live: List[Fact]) -> Dict[str, List[Fact]]:
         """Смежность сущностей для обхода.
@@ -676,6 +815,7 @@ class TriplexMemory:
                 "relations_proposed": sum(1 for r in self.relations.values() if r["proposed"]),
                 "facts_records": len(self.journal.facts),
                 "facts_active": len(self.journal.query()),
+                "thoughts_logged": len(self.thoughts),
                 "encoder": self.encoder.name,
                 "embed_model": getattr(self.encoder, "model", None),
                 "embed_dim": getattr(self.encoder, "dim", None),

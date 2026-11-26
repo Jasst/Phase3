@@ -5,7 +5,7 @@
   память ТРИПЛЕКСИИ : triplex_ingest, triplex_search, triplex_query, triplex_assert,
                       triplex_supersede, triplex_retract, triplex_confirm,
                       triplex_define_relation, triplex_stats, triplex_check
-  фаза 4            : triplex_think (импульс/мысль), triplex_feedback (валентность)
+  фаза 4            : triplex_think (импульс/мысль), triplex_feedback (валентность), triplex_thoughts, triplex_reflect
   память (сервис)   : triplex_graph (карта нейронов), activity_recent (журнал действий)
   личность          : identity_propose, identity_commit, identity_chain
   общее ядро        : core_get; core_propose / core_commit — только администратор
@@ -211,31 +211,46 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                       k: int = Field(8, ge=1, le=50),
                       steps: int = Field(3, ge=1, le=8),
                       as_of: Optional[str] = Field(None, description="ISO 8601, по умолчанию сейчас"),
+                      parent_thought_id: Optional[str] = Field(
+                          None, description="id предыдущей мысли, если это её продолжение"),
+                      adaptive: bool = Field(True, description="адаптировать бюджет под цель и граф"),
                       ctx: Context = None) -> Dict[str, Any]:
-        """Фаза 4: пустить импульс по графу и вернуть мысль — путь, активацию и источники."""
+        """Фаза 4+: пустить импульс и вернуть мысль — путь, альтернативы, активацию, источники."""
         uid, mem, e = mem_of(ctx)
         if e:
             return e
-        return mem.think(query, goal=goal, as_of=as_of, k=k, steps=steps, scope="mcp:" + uid)
+        return mem.think(query, goal=goal, as_of=as_of, k=k, steps=steps, scope="mcp:" + uid,
+                         parent_thought_id=parent_thought_id, adaptive=adaptive)
 
     @mcp.tool()
-    @audit("triplex_feedback", lambda k: f"{len(k.get('fact_ids') or [])} × {k.get('valence')}")
-    def triplex_feedback(fact_ids: List[str] = Field(..., min_length=1,
-                                                     description="Путь из triplex_think, по порядку"),
-                         valence: float = Field(..., ge=-1, le=1,
-                                                description=">0 — мысль подтвердилась, <0 — ошибка"),
-                         thought_id: Optional[str] = Field(
-                             None, description="id из triplex_think; без него берётся последняя мысль"),
-                         ctx: Context = None) -> Dict[str, Any]:
-        """Фаза 4: обратное кредитование пути (limbic-like), без изменения I10.
+    @audit("triplex_feedback", lambda k: (f"{len(k.get('fact_ids') or [])} × {k.get('valence')}"
+                                          if not k.get("verdicts") else
+                                          f"{len(k['verdicts'])} verdict(s)"))
+    def triplex_feedback(
+            fact_ids: List[str] = Field(default_factory=list,
+                                        description="Путь из triplex_think, по порядку (старый вызов)"),
+            valence: Optional[float] = Field(None, ge=-1, le=1,
+                                             description=">0 — мысль подтвердилась, <0 — ошибка"),
+            thought_id: Optional[str] = Field(
+                None, description="id из triplex_think; без него берётся последняя мысль"),
+            verdicts: Optional[List[dict]] = Field(
+                None, description="Phase4+: [{fact_id, valence, reason}] — оценка каждого звена"),
+            overall_valence: Optional[float] = Field(
+                None, ge=-1, le=1, description="Общая оценка мысли при verdicts"),
+            outcome: str = Field("", description="accepted | rejected | partial | needs_source"),
+            ctx: Context = None) -> Dict[str, Any]:
+        """Фаза 4+: обратное кредитование мысли, без изменения I10.
 
-        Факты должны принадлежать этой мысли: произвольный id не подкрепляется.
+        Старый вызов `fact_ids + valence` работает как раньше. Новый — `verdicts`
+        с причиной good/irrelevant/outdated/wrong_relation/missing_link/contradiction.
+        Факты должны принадлежать одному из путей мысли; чужой id отвергается.
         """
         uid, mem, e = mem_of(ctx)
         if e:
             return e
         try:
-            out = mem.feedback(fact_ids, valence, thought_id=thought_id, scope="mcp:" + uid)
+            out = mem.feedback(fact_ids, valence, thought_id=thought_id, scope="mcp:" + uid,
+                               verdicts=verdicts, overall_valence=overall_valence, outcome=outcome)
         except (ValueError, KeyError) as exc:
             return _err(str(exc))
         if out.get("status") == "rejected":
@@ -556,6 +571,33 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return mem.graph(max_edges=max_edges, scope="mcp:" + uid)
 
     @mcp.tool()
+    @audit("triplex_thoughts", lambda k: f"limit={k.get('limit')} goal={k.get('goal', '')}")
+    def triplex_thoughts(limit: int = Field(20, ge=1, le=200),
+                         goal: str = Field("", description="Фильтр по цели или подцели"),
+                         ctx: Context = None) -> Dict[str, Any]:
+        """История мыслей текущего пользователя: цели, пути, исходы. Мысли живут после перезапуска."""
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        rows = mem.thoughts.recent(limit, goal=goal, scope="mcp:" + uid)
+        return {"user": uid, "count": len(rows), "thoughts": rows}
+
+    @mcp.tool()
+    @audit("triplex_reflect", lambda k: f"thought_id={k.get('thought_id')}")
+    def triplex_reflect(thought_id: str = Field(..., description="id из triplex_think"),
+                        ctx: Context = None) -> Dict[str, Any]:
+        """Разобрать конкретную мысль: все пути, альтернативы, открытые вопросы, обратную связь."""
+        uid, mem, e = mem_of(ctx)
+        if e:
+            return e
+        row = mem.thoughts.get(thought_id)
+        if row is None:
+            return _err("мысль с таким thought_id не найдена в журнале")
+        if row.get("scope") and row["scope"] != "mcp:" + uid:
+            return _err("мысль принадлежит другому scope")
+        return row
+
+    @mcp.tool()
     def activity_recent(limit: int = Field(30, ge=1, le=200), ctx: Context = None) -> Dict[str, Any]:
         """Последние действия сервера для вас: поиски, сохранения, ошибки (новые сверху).
         Агенту — чтобы не повторять уже сделанную работу и видеть, что не удалось."""
@@ -570,40 +612,16 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         uid, mem, e = mem_of(ctx)
         if e:
             return e
-        tools = {
-            "triplex_ingest": "text → doc_id; session_id, role, model, recorded_at",
-            "triplex_search": "query; k, goal, as_of, include_archived, activate, remember_thought",
-            "triplex_think": "query; goal, k, steps, as_of → path и thought_id",
-            "triplex_feedback": "fact_ids из thought.path, valence [-1,1], thought_id из triplex_think",
-            "triplex_query": "s/r/o/as_of — все фильтры необязательны",
-            "triplex_assert": "s, r, o, doc_id, span=[start,end], confidence, functional",
-            "triplex_supersede": "old_fact_id, s, r, o, valid_from, doc_id, span",
-            "triplex_facts": "limit — действующие факты с полем agent",
-            "triplex_link": "entity_id, alias — привязать написание к сущности",
-            "triplex_retract": "fact_id — отозвать факт, запись остаётся в журнале",
-            "triplex_confirm": "fact_id, yes — изменить уверенность (+0.15 или ×0.5)",
-            "triplex_define_relation": "canonical, aliases, functional, tau_days",
-            "triplex_stats": "счётчики памяти",
-            "triplex_check": "проверка инвариантов журнала",
-            "triplex_consolidate": "сухой прогон «сна»; обучение отдельно: python -m pulsenet train-sleep",
-            "triplex_graph": "max_edges — узлы и связи памяти",
-            "identity_propose": "content, kind, evidence_quote — цитата из памяти обязательна",
-            "identity_commit": "candidate_id — после карантина IDENTITY_MIN_DAYS",
-            "identity_chain": "история формулировок личности",
-            "core_get": "общее ядро, читают все",
-            "core_propose": "предложить изменение ядра — только администратор",
-            "core_commit": "применить изменение ядра — только администратор",
-            "web_search": "query или queries (до 4), max_results",
-            "web_fetch": "url — только публичные http(s), без редиректов",
-            "image_generate": "prompt; steps, width, height, cfg_scale, seed, sampler, negative_prompt, "
-                "backends, return_image",
-            "code_list": "root из CODE_ROOTS, subdir",
-            "code_read": "root, path, start, end — до 300 строк",
-            "code_search": "root, pattern — поиск без учёта регистра",
-            "activity_recent": "limit — журнал действий пользователя",
-            "pulsenet_guide": "этот описатель и текущее состояние",
-            "whoami": "кто вы для сервера и какие возможности доступны",
-        }
+        # Каталог строится из реального реестра инструментов: ручной список
+        # однажды уже разошёлся с сигнатурой code_search.
+        def brief(tool) -> str:
+            doc = (tool.description or "").strip().splitlines()
+            text = doc[0] if doc else tool.name
+            args = [a for a in (tool.parameters or {}).get("properties", {}) if a != "ctx"]
+            suffix = "; args: " + ", ".join(args[:9]) if args else ""
+            return text[:180] + suffix
+
+        tools = {t.name: brief(t) for t in mcp._tool_manager.list_tools()}
         return {
             "server": SERVER_NAME,
             "version": SERVER_VERSION,
@@ -612,9 +630,13 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
                         "документов; ответы без источника не записываются."),
             "workflow": [
                 "Перед нетривиальной задачей: triplex_search с формулировкой задачи.",
-                "Фаза 4: triplex_think(query, goal) — пустить импульс и получить мысль с путём и thought_id;",
+                "Фаза 4+: triplex_think(query, goal) — пустить импульс и получить мысль: path, paths, "
+                "alternatives, open_questions и thought_id;",
                 "если мысль подтвердилась/опровергнулась — triplex_feedback(fact_ids из thought.path, "
-                "valence, thought_id из triplex_think); чужие id не принимаются.",
+                "valence, thought_id из triplex_think) или verdicts=[{fact_id, valence, reason}] "
+                "с outcome; чужие id не принимаются.",
+                "История мыслей живёт после перезапуска: triplex_thoughts(limit, goal), "
+                "triplex_reflect(thought_id) — разбор путей и обратной связи.",
                 "После решения: triplex_ingest (получить doc_id), затем triplex_assert с doc_id и span=[start,end].",
                 "Устаревший факт: triplex_supersede(old_fact_id, ..., valid_from, doc_id, span) или triplex_retract.",
                 "Свежие факты, документация, сравнения: web_search, затем web_fetch для полного текста.",

@@ -7,9 +7,12 @@
 
 - Перед нетривиальной задачей вызовите `triplex_search` с формулировкой задачи. Если найдены факты
   или `context`, учитывайте их и скажите, что опираетесь на память.
-- Для проверки гипотезы или поиска пути по графу используйте `triplex_think({query, goal})`. Если мысль
-  подтвердилась или опроверглась, вызовите `triplex_feedback({fact_ids: thought.path, valence, thought_id})`;
-  `thought_id` берётся из результата `triplex_think`, произвольные id не принимаются. Подробности — `docs/PHASE4.md`.
+- Для проверки гипотезы или поиска пути по графу используйте `triplex_think({query, goal})`: он возвращает
+  `path`, `paths`, `alternatives`, `open_questions` и `thought_id`. Если мысль подтвердилась или
+  опроверглась, вызовите `triplex_feedback({fact_ids: [fact_id из thought.path], valence, thought_id})`
+  либо `triplex_feedback({verdicts: [{fact_id, valence, reason}], outcome, thought_id})`. `thought_id`
+  берётся из результата `triplex_think`, произвольные id не принимаются. История и разбор мыслей —
+  `triplex_thoughts` / `triplex_reflect`. Подробности — `docs/PHASE4.md`.
 - Если факт из памяти расходится с кодом или с реальностью, доверяйте реальности: замените факт
   через `triplex_supersede({old_fact_id, s, r, o, valid_from, doc_id, span})` или отзовите через `triplex_retract({fact_id})`.
 - После подтверждённого решения (архитектура, библиотека, найденный баг, правило проекта):

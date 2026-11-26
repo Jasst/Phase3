@@ -64,7 +64,8 @@ def test_new_tools_are_registered(server):
                 return {t.name for t in (await sess.list_tools()).tools}
 
     got = asyncio.run(names())
-    assert {"triplex_graph", "activity_recent", "pulsenet_guide", "web_search", "web_fetch"} <= got
+    assert {"triplex_graph", "activity_recent", "pulsenet_guide", "web_search", "web_fetch",
+            "triplex_thoughts", "triplex_reflect"} <= got
 
 
 def test_guide_describes_server_and_state(server):
@@ -87,12 +88,43 @@ def test_guide_describes_server_and_state(server):
     described = json.dumps(g["tools"], ensure_ascii=False)
     for name in sorted(names):
         assert name in described, f"pulsenet_guide не описывает инструмент {name}"
-    assert g["tools_count"] == len(names) == 31
+    assert g["tools_count"] == len(names) == 33
 
     workflow = "\n".join(g["workflow"])
     assert "triplex_feedback(fact_ids" in workflow
     assert "triplex_feedback(path" not in workflow
     assert "thought_id" in workflow
+
+
+def test_thoughts_and_reflect_tools(server):
+    """Phase4+: мысль переживает вызов и видна в истории/разборе, verdict'ы принимаются."""
+    doc = _call(server["url"], server["alice"], "triplex_ingest",
+                {"text": "Алиса работает в Lab. Алиса любит кота."})
+    src = {"doc_id": doc["doc_id"], "span": [0, 10]}
+    for s, r, o in [("Алиса", "работает в", "Lab"), ("Алиса", "любит", "кот")]:
+        _call(server["url"], server["alice"], "triplex_assert", {**src, "s": s, "r": r, "o": o})
+
+    th = _call(server["url"], server["alice"], "triplex_think",
+               {"query": "Алиса", "goal": "где работает Алиса", "steps": 2})
+    assert th["status"] == "ok" and th["thought_id"]
+    assert th["paths"] and [p["fact_id"] for p in th["path"]] == th["paths"][0]["ids"]
+    tid = th["thought_id"]
+
+    history = _call(server["url"], server["alice"], "triplex_thoughts", {"limit": 5})
+    assert any(t["thought_id"] == tid for t in history["thoughts"])
+    assert _call(server["url"], server["bob"], "triplex_thoughts", {"limit": 5})["count"] == 0
+
+    reflected = _call(server["url"], server["alice"], "triplex_reflect", {"thought_id": tid})
+    assert reflected["thought_id"] == tid
+    assert _call(server["url"], server["bob"], "triplex_reflect", {"thought_id": tid})["status"] == "error"
+
+    fid = th["path"][-1]["fact_id"]
+    fb = _call(server["url"], server["alice"], "triplex_feedback", {
+        "thought_id": tid, "verdicts": [{"fact_id": fid, "valence": 1, "reason": "good"}],
+        "outcome": "accepted"})
+    assert fb["status"] == "ok" and fb["outcome"] == "accepted"
+    assert _call(server["url"], server["alice"], "triplex_reflect",
+                 {"thought_id": tid})["outcome"]["status"] == "accepted"
 
 
 def test_activity_records_operations_per_user(server):

@@ -1,4 +1,4 @@
-# pulsenet-unified: 31 инструмент
+# pulsenet-unified: 33 инструмента
 
 Источник — `pulsenet/unified_mcp/server.py` и живой `tools/list`. Если подпись здесь расходится с `tools/list`, доверяйте `tools/list`.
 
@@ -8,8 +8,10 @@
 |---|---|
 | `triplex_ingest` | `text` (обязательно); `session_id=""`, `role="user"`, `model=""`, `recorded_at=""` |
 | `triplex_search` | `query` (обязательно); `k=8` (1–50), `as_of=null`, `include_archived=false`, `goal=""`, `activate=true`, `remember_thought=true` |
-| `triplex_think` | `query` (обязательно); `goal=""`, `k=8`, `steps=3` (1–8), `as_of=null` |
-| `triplex_feedback` | `fact_ids` (список из `thought.path`), `valence` (-1…1), `thought_id` из результата `triplex_think` |
+| `triplex_think` | `query` (обязательно); `goal=""`, `k=8`, `steps=3` (1–8), `as_of=null`, `parent_thought_id=null`, `adaptive=true`; возвращает `path`, `paths`, `alternatives`, `open_questions`, `thought_id` |
+| `triplex_feedback` | старый вызов: `fact_ids` (fact_id из `thought.path`), `valence` (-1…1), `thought_id`; Phase4+: `verdicts=[{fact_id, valence, reason}]`, `overall_valence`, `outcome`. `reason`: good / irrelevant / outdated / wrong_relation / missing_link / contradiction |
+| `triplex_thoughts` | `limit=20` (1–200), `goal=""` — история мыслей текущего пользователя (переживает перезапуск) |
+| `triplex_reflect` | `thought_id` — разбор мыслей: все пути, альтернативы, открытые вопросы, события обратной связи |
 | `triplex_query` | `s`, `r`, `o`, `as_of` — все необязательны |
 | `triplex_assert` | `s`, `r`, `o`, `doc_id`, `span=[start,end]`; `confidence=0.8`, `functional=false` |
 | `triplex_supersede` | `old_fact_id`, `s`, `r`, `o`, `valid_from` (ISO 8601), `doc_id`, `span`; `confidence=0.8`, `functional=false` |
