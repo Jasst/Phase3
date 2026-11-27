@@ -24,6 +24,7 @@ from .toolcalls import COMMANDS, agent_limits
 from .workspace import Workspace, WorkspaceError
 
 MEMORY_TOOLS = ("memory_search", "memory_remember")
+MEMORY_THINK_TOOLS = ("memory_think", "memory_feedback")
 WEB_TOOLS = ("web_search", "web_fetch")
 IMAGE_TOOL = "image_generate"
 SKILL_TOOLS = ("skill_list", "skill_read", "skill_write", "skill_patch")
@@ -34,10 +35,10 @@ TODO_STATUS = ("pending", "in_progress", "done")
 SUBAGENT_TOOL = "subagent"
 # Инструменты, которые меняют общее состояние: в одном шаге они идут строго по очереди.
 SEQUENTIAL_TOOLS = frozenset({PLAN_TOOL, "skill_write", "skill_patch", "note_write", "note_append",
-                              "memory_remember"})
+                              "memory_remember", "memory_feedback"})
 # Субагенту не даём: рекурсия, план и любые записи — их делает основной агент.
 SUBAGENT_DENY = frozenset({SUBAGENT_TOOL, PLAN_TOOL, "skill_write", "skill_patch", "note_write",
-                           "note_append", "memory_remember"})
+                           "note_append", "memory_remember", "memory_feedback"})
 
 SPECS: Dict[str, dict] = {
     "memory_search": {
@@ -51,6 +52,28 @@ SPECS: Dict[str, dict] = {
         "description": "Сохранить в память важный факт или заметку. Факты извлекаются в фоне.",
         "parameters": {"type": "object", "properties": {"text": {"type": "string"}},
                        "required": ["text"]},
+    },
+    "memory_think": {
+        "description": "Пустить активационный импульс по графу памяти: вернуть пути мысли, альтернативы, "
+                       "открытые вопросы, конфликты и thought_id. Используй, когда нужно проверить гипотезу "
+                       "или понять, чего не хватает в памяти.",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string"},
+                                      "goal": {"type": "string"},
+                                      "k": {"type": "integer", "minimum": 1, "maximum": 20},
+                                      "steps": {"type": "integer", "minimum": 1, "maximum": 8}},
+                       "required": ["query"]},
+    },
+    "memory_feedback": {
+        "description": "Оценить мысль из memory_think/memory_search: укрепить полезные факты или ослабить "
+                       "ошибочные. Передавай thought_id и fact_ids из path; valence от -1 до 1. "
+                       "Используй только при явном подтверждении или опровержении.",
+        "parameters": {"type": "object",
+                       "properties": {"thought_id": {"type": "string"},
+                                      "fact_ids": {"type": "array", "items": {"type": "string"}},
+                                      "valence": {"type": "number", "minimum": -1, "maximum": 1},
+                                      "outcome": {"type": "string"}},
+                       "required": ["thought_id", "fact_ids", "valence"]},
     },
     "web_search": {
         "description": "Поиск в интернете до 3 запросов сразу. Возвращает пронумерованные источники "
@@ -242,9 +265,11 @@ class ChatTools:
                  mcp_specs: Optional[Dict[str, dict]] = None,
                  workspace: Optional[Workspace] = None,
                  on_event: Optional[Callable[[str, Any], None]] = None,
-                 subagent: Optional[Callable[[str, List[str]], "Outcome"]] = None):
+                 subagent: Optional[Callable[[str, List[str]], "Outcome"]] = None,
+                 memory: Any = None):
         self._recall = recall
         self._remember = remember
+        self.memory = memory
         # workspace — навыки/заметки под data_unified; on_event(kind, payload) — события интерфейса
         # (план todo_write). Без них инструменты рабочего пространства не предлагаются.
         self.workspace = workspace
@@ -255,6 +280,10 @@ class ChatTools:
         self._web_lock = threading.Lock()
         self.last_image: Optional[str] = None      # URL последней картинки хода — для note_write
         self.todos: List[dict] = []
+        self.thought_id: str = ""                  # последняя мысль memory_search/think этого хода
+        self.thought_path: List[str] = []
+        self.gaps: List[dict] = []                 # сигналы нехватки знаний
+        self.feedback_sent = False                 # авто-feedback за ход отправляется один раз
         # web: None — взять модуль веб-поиска автоматически; False — веб выключен (тесты, без сети)
         self._web = _web_module() if web is None else (web or None)
         self._src_n = 0
@@ -276,6 +305,10 @@ class ChatTools:
 
     def available(self, web: bool, memory: bool) -> List[str]:
         names: List[str] = list(MEMORY_TOOLS) if memory else []
+        if memory:
+            think = self.memory or getattr(self._recall, "__self__", None)
+            if think is not None and hasattr(think, "think") and hasattr(think, "feedback"):
+                names += list(MEMORY_THINK_TOOLS)
         if self._subagent is not None:
             names.append(SUBAGENT_TOOL)
         if web and self._web is not None:
@@ -310,6 +343,10 @@ class ChatTools:
             return f"Память: «{_clip(args.get('query'), 50)}»"
         if name == "memory_remember":
             return "Запоминаю"
+        if name == "memory_think":
+            return f"Думаю по памяти: «{_clip(args.get('query'), 50)}»"
+        if name == "memory_feedback":
+            return "Обратная связь по мысли"
         if name in SKILL_TOOLS or name in NOTE_TOOLS:
             target = args.get("name") or args.get("title") or ""
             verb = {"skill_list": "Навыки", "skill_read": "Читаю навык", "skill_write": "Пишу навык",
@@ -356,6 +393,10 @@ class ChatTools:
                 return self._memory_search(args)
             if name == "memory_remember":
                 return self._memory_remember(args)
+            if name == "memory_think":
+                return self._memory_think(args)
+            if name == "memory_feedback":
+                return self._memory_feedback(args)
             if name in WORKSPACE_TOOLS and self.workspace is not None:
                 return self._workspace_tool(name, args)
             if name in self._mcp_specs and self._mcp_call is not None:
@@ -499,6 +540,33 @@ class ChatTools:
         text = json.dumps(data, ensure_ascii=False) if not isinstance(data, str) else data
         return Outcome(True, text, label=name, detail=_clip(text, 120))
 
+    def _capture_thought(self, thought: Any) -> None:
+        if not isinstance(thought, dict):
+            return
+        tid = _str(thought.get("thought_id"))
+        path = [p.get("fact_id") for p in (thought.get("path") or []) if isinstance(p, dict) and p.get("fact_id")]
+        if tid:
+            self.thought_id = tid
+        if path:
+            self.thought_path = path
+        gaps = self._thought_gaps(thought)
+        if gaps:
+            self.gaps.extend(gaps)
+
+    def _thought_gaps(self, thought: Any) -> List[dict]:
+        if not isinstance(thought, dict):
+            return []
+        gaps = []
+        status = _str(thought.get("status"))
+        path = thought.get("path") or []
+        open_questions = thought.get("open_questions") or []
+        conflicts = thought.get("conflicts") or []
+        if status and status not in ("ok", "empty") or open_questions or conflicts or not path:
+            gaps.append({"kind": status or "gap", "thought_id": _str(thought.get("thought_id")),
+                         "open_questions": list(open_questions)[:3],
+                         "conflicts": len(conflicts), "path_len": len(path)})
+        return gaps
+
     def _memory_search(self, args: dict) -> Outcome:
         query = _str(args.get("query"))
         if not query:
@@ -508,9 +576,12 @@ class ChatTools:
         facts = [f"- {f.get('text', '')} (уверенность {f.get('confidence', '?')})"
                  for f in r.get("facts", [])]
         chunks = [f"> {_clip(c.get('text', ''), 400)}" for c in r.get("chunks", [])]
-        thought_lines = _thought_brief(r.get("thought"))
+        thought = r.get("thought")
+        self._capture_thought(thought)
+        thought_lines = _thought_brief(thought)
         if not facts and not chunks and not thought_lines:
             text = "В памяти ничего не найдено."
+            self.gaps.append({"kind": "no_memory", "query": query})
         else:
             parts = []
             if facts:
@@ -519,6 +590,12 @@ class ChatTools:
                 parts += ["Фрагменты документов:"] + chunks
             if thought_lines:
                 parts += [""] + thought_lines
+            open_q = (thought or {}).get("open_questions") or []
+            conflicts = (thought or {}).get("conflicts") or []
+            if open_q:
+                parts += ["Открытые вопросы:"] + [f"- {_clip(q, 180)}" for q in open_q[:3]]
+            if conflicts:
+                parts.append(f"Конфликты в памяти: {len(conflicts)}. Проверь источники перед выводом.")
             text = "\n".join(parts)
         return Outcome(True, text, label=f"Память: «{_clip(query, 50)}»",
                        detail=f"фактов: {len(facts)}, фрагментов: {len(chunks)},"
@@ -534,6 +611,59 @@ class ChatTools:
         else:
             msg = "Память выключена, сохранить нельзя."
         return Outcome(r.get("status") == "queued", msg, label="Запомнить", detail=_clip(text, 60))
+
+    def _memory_obj(self):
+        return self.memory or getattr(self._recall, "__self__", None)
+
+    def _memory_think(self, args: dict) -> Outcome:
+        mem = self._memory_obj()
+        if mem is None or not hasattr(mem, "think"):
+            return Outcome(False, "Инструмент мышления по памяти недоступен.", label="Мысль")
+        query = _str(args.get("query"))
+        if not query:
+            return Outcome(False, "Пустой запрос.", label="Мысль", detail="пустой запрос")
+        goal = _str(args.get("goal"))
+        k = _int(args.get("k"), 8, 1, 20)
+        steps = _int(args.get("steps"), 3, 1, 8)
+        thought = mem.think(query, goal=goal, k=k, steps=steps)
+        self._capture_thought(thought)
+        lines = _thought_brief(thought)
+        if not lines:
+            self.gaps.append({"kind": "no_thought", "query": query})
+            return Outcome(True, "Мысль не сформировалась: подходящих фактов не активировано.", label="Мысль")
+        open_q = thought.get("open_questions") or []
+        conflicts = thought.get("conflicts") or []
+        if open_q:
+            lines += ["Открытые вопросы:"] + [f"- {_clip(q, 180)}" for q in open_q[:3]]
+        if conflicts:
+            lines.append(f"Конфликты: {len(conflicts)}")
+        lines.append(f"thought_id: {_str(thought.get('thought_id'))}")
+        return Outcome(True, "\n".join(lines), label=f"Мысль: «{_clip(query, 50)}»",
+                       detail=f"путь: {len(thought.get('path') or [])}, альтернатив: {len(thought.get('alternatives') or [])}")
+
+    def _memory_feedback(self, args: dict) -> Outcome:
+        mem = self._memory_obj()
+        if mem is None or not hasattr(mem, "feedback"):
+            return Outcome(False, "Инструмент обратной связи недоступен.", label="Обратная связь")
+        thought_id = _str(args.get("thought_id"))
+        fact_ids = args.get("fact_ids") or []
+        if not isinstance(fact_ids, list):
+            fact_ids = []
+        fact_ids = [_str(x) for x in fact_ids if _str(x)]
+        try:
+            valence = float(args.get("valence"))
+        except (TypeError, ValueError):
+            return Outcome(False, "valence должен быть числом от -1 до 1.", label="Обратная связь")
+        outcome = _str(args.get("outcome")) or "ok"
+        if not thought_id or not fact_ids:
+            return Outcome(False, "Нужны thought_id и fact_ids из пути мысли.", label="Обратная связь")
+        out = mem.feedback(fact_ids=fact_ids, valence=valence, thought_id=thought_id, outcome=outcome)
+        if not isinstance(out, dict) or out.get("status") not in ("ok", "accepted"):
+            msg = out.get("message", "обратная связь отклонена") if isinstance(out, dict) else "ошибка"
+            return Outcome(False, f"Обратная связь не принята: {_clip(msg, 200)}", label="Обратная связь")
+        self.feedback_sent = True
+        return Outcome(True, f"Обратная связь записана для мысли {thought_id}.", label="Обратная связь",
+                       detail=f"фактов: {len(fact_ids)}, valence: {valence:.2f}")
 
     def _web_search(self, args: dict) -> Outcome:
         if self._web is None:

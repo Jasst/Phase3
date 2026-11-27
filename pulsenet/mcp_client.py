@@ -178,26 +178,47 @@ class RemoteMemory:
 
     def recall(self, query: str, as_of: Optional[str] = None, k_facts: int = 8,
                include_archived: bool = False, activate: bool = True,
-               remember_thought: bool = True) -> dict:
+               remember_thought: bool = True, goal: str = "", steps: int = 3,
+               scope: str = "", adaptive: bool = True,
+               parent_thought_id: Optional[str] = None) -> dict:
         args: Dict[str, Any] = {"query": query, "k": int(k_facts),
                                 "include_archived": bool(include_archived),
                                 "activate": bool(activate),
-                                "remember_thought": bool(remember_thought)}
+                                "remember_thought": bool(remember_thought),
+                                "goal": goal, "steps": int(steps), "adaptive": bool(adaptive)}
         if as_of:
             args["as_of"] = as_of
+        if parent_thought_id:
+            args["parent_thought_id"] = parent_thought_id
         return self.client.call("triplex_search", args)
 
     def think(self, query: str, goal: str = "", k: int = 8, steps: int = 3,
-              as_of: Optional[str] = None, scope: str = "") -> dict:
-        args: Dict[str, Any] = {"query": query, "goal": goal, "k": int(k), "steps": int(steps)}
+              as_of: Optional[str] = None, scope: str = "",
+              parent_thought_id: Optional[str] = None, adaptive: bool = True) -> dict:
+        args: Dict[str, Any] = {"query": query, "goal": goal, "k": int(k), "steps": int(steps),
+                                "adaptive": bool(adaptive)}
         if as_of:
             args["as_of"] = as_of
+        if parent_thought_id:
+            args["parent_thought_id"] = parent_thought_id
         return self.client.call("triplex_think", args)
 
-    def feedback(self, fact_ids: List[str], valence: float, thought_id: Optional[str] = None) -> dict:
-        args = {"fact_ids": list(fact_ids), "valence": float(valence)}
+    def feedback(self, fact_ids: Optional[List[str]] = None, valence: Optional[float] = None,
+                 thought_id: Optional[str] = None, verdicts: Optional[List[dict]] = None,
+                 overall_valence: Optional[float] = None, outcome: str = "") -> dict:
+        args: Dict[str, Any] = {}
+        if fact_ids is not None:
+            args["fact_ids"] = list(fact_ids)
+        if valence is not None:
+            args["valence"] = float(valence)
         if thought_id:
             args["thought_id"] = thought_id
+        if verdicts is not None:
+            args["verdicts"] = verdicts
+        if overall_valence is not None:
+            args["overall_valence"] = float(overall_valence)
+        if outcome:
+            args["outcome"] = outcome
         return self.client.call("triplex_feedback", args)
 
     def ingest(self, text: str, session_id: str = "", role: str = "user",

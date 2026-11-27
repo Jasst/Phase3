@@ -699,15 +699,40 @@ class App:
         return ("Факты и фрагменты из памяти пользователя (используй, только если относятся к вопросу; "
                 "источники указаны):\n" + ctx)
 
-    def _tool_recall(self, query: str, k: int) -> dict:
-        # Инструмент чата не должен перезаписывать мысль, пущенную пользователем в графе.
-        return self.memory.recall(query, k_facts=k, activate=True, remember_thought=False)
+    def _tool_recall(self, query: str, k: int, scope: str = "", remember_thought: bool = True) -> dict:
+        # Чат хранит след мысли в своём scope, чтобы авто-feedback мог ссылаться на thought_id,
+        # не затирая мысль пользователя в графе/веб-интерфейсе.
+        return self.memory.recall(query, k_facts=k, activate=True,
+                                  remember_thought=remember_thought, scope=scope)
 
     def _tool_remember(self, text: str, chat_id: str) -> dict:
         if not self.memory_enabled:
             return {"status": "disabled"}
         self.index_async(text, chat_id, "user", force=True)
         return {"status": "queued"}
+
+    def _auto_memory_feedback(self, tools, stop_reason: str, has_answer: bool,
+                              failures: int, trace: List[str]) -> None:
+        """Консервативный авто-feedback: только явные сигналы, без переписывания фактов."""
+        if not self.memory_enabled or getattr(tools, "feedback_sent", False):
+            return
+        thought_id = getattr(tools, "thought_id", "")
+        path = list(getattr(tools, "thought_path", []) or [])
+        if not thought_id or not path:
+            return
+        # Явный отрицательный сигнал: инструменты сорвались/ответа нет.
+        if failures > 0 or stop_reason in {"failures", "bad_calls", "llm_error"} or not has_answer:
+            valence, outcome = -0.25, "rejected"
+        # Явный положительный сигнал: ответ получен, ошибок не было, явных дыр не видно.
+        elif stop_reason == "model_done" and has_answer and failures == 0 and not getattr(tools, "gaps", []):
+            valence, outcome = 0.15, "accepted"
+        else:
+            return
+        try:
+            self.memory.feedback(fact_ids=path[:8], valence=valence, thought_id=thought_id, outcome=outcome)
+            tools.feedback_sent = True
+        except Exception as exc:                  # noqa: BLE001 — авто-обучение не должно ломать ответ
+            self.log_error("авто-обратная связь памяти", exc)
 
     def graph(self, max_edges: int = 200, scope: str = "") -> dict:
         """Карта «нейронов» памяти для интерфейса и других клиентов."""
@@ -852,12 +877,14 @@ class App:
 
         # Инструменты: локальные + динамический каталог MCP (image_generate, triplex_*, ...).
         mcp_specs = self._mcp_tool_specs()
-        tools = ChatTools(recall=self._tool_recall,
+        memory_scope = f"chat:{uid or 'anon'}:{chat_id or 'default'}"
+        tools = ChatTools(recall=lambda q, k: self._tool_recall(q, k, scope=memory_scope, remember_thought=True),
                           remember=lambda text: self._tool_remember(text, chat_id),
                           mcp_call=self._mcp_tool_call if self.mcp_tools_enabled else None,
                           mcp_specs=mcp_specs,
                           workspace=self.workspace,
-                          on_event=lambda kind, payload: on_delta(kind, payload))
+                          on_event=lambda kind, payload: on_delta(kind, payload),
+                          memory=self.memory if self.memory_enabled else None)
         # Субагент получает инструменты текущего хода (без записи и без рекурсии).
         # Подключаем до available(): иначе инструмент subagent не попадёт в каталог.
         tools.set_subagent(lambda task, requested: self._run_subagent(
@@ -1434,6 +1461,8 @@ class App:
                       "Модель написала <tool_result> без реального вызова инструмента")
             parts[:] = []
             answer = ""
+        self._auto_memory_feedback(tools, stop_reason, bool(answer), failures, trace)
+
         if stop_reason == "model_done":
             # Причина в трассе должна совпадать с реальным ответом: раньше при любом
             # нормальном финале писалось «без текста», хотя текст уже был показан.
