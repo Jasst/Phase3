@@ -132,6 +132,8 @@ def test_code_sandbox_blocks_traversal_and_secrets():
     assert ca.read("owner", "proj", ".env")["status"] == "error"
     s = ca.search("owner", "proj", "print")
     assert s["hits"] and s["hits"][0]["path"].replace("\\", "/") == "src/a.py"
+    assert "доступны" in ca.read("owner", "other", "src/a.py")["message"]
+    assert "CODE_ROOTS" in CodeAccess({}, {"owner"}).read("owner", "proj", "x")["message"]
 
 
 # ---------- SSRF ----------

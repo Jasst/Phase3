@@ -195,6 +195,8 @@ def _many_facts(mem, n):
         f = mem.journal.facts[out["fact_id"]]
         f.access_count = 5
         f.valid_from = "2025-01-01T00:00:00+00:00"
+        if i >= n - 10:                     # явно негодные для обучения — выборка для гейта
+            f.confidence = 0.5              # ниже CONF_MIN, но факт остаётся активным
 
 
 def test_gate_rows_are_disjoint_from_training_rows(tmp_path):

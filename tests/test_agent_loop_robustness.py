@@ -179,6 +179,30 @@ def test_consecutive_failures_stop_turn(tmp_path):
     assert trace[-1]["stop"] == "failures"
 
 
+def test_unlimited_agent_stops_semantic_cycle(tmp_path):
+    """Безлимитный агент (0/0) всё ещё вызывает инструменты, но не крутит один и тот же набор."""
+    # Полные аргументы разные (k меняется), поэтому кэш по JSON не срабатывает.
+    # По смыслу (query="привет") это один и тот же вызов три раунда подряд.
+    script = [[_call("memory_search", {"query": "привет", "k": i})] for i in range(3)] + [["итог."]]
+    app = _app(tmp_path, script, env_extra={"AGENT_MAX_ROUNDS": "0", "AGENT_MAX_CALLS": "0"})
+    answer, trace = _run(app)
+    stops = [t.get("stop") for t in trace if t.get("stop")]
+    assert "no_progress" in stops
+    assert answer.endswith("итог.")
+
+
+def test_unlimited_agent_keeps_distinct_tool_calls(tmp_path):
+    """Защита от цикла не запрещает нормальные разные вызовы безлимитному агенту."""
+    script = [[_call("memory_search", {"query": "a"})],
+              [_call("memory_search", {"query": "b"})],
+              ["готово."]]
+    app = _app(tmp_path, script, env_extra={"AGENT_MAX_ROUNDS": "0", "AGENT_MAX_CALLS": "0"})
+    answer, trace = _run(app)
+    stops = [t.get("stop") for t in trace if t.get("stop")]
+    assert "no_progress" not in stops
+    assert answer.endswith("готово.")
+
+
 # ---------- разбор вызовов ----------
 
 def test_parse_accepts_common_model_variants():

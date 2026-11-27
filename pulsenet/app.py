@@ -45,6 +45,24 @@ FAIL_STREAK_LIMIT = 3
 IDLE_ROUNDS_LIMIT = 2
 # Раунды подряд, где все вызовы не разобраны (нет name/arguments): отдельная причина останова.
 BAD_ROUNDS_LIMIT = 2
+# Сколько подряд раундов с одним и тем же набором вызовов считаются зацикливанием
+# (даже в безлимитном режиме AGENT_MAX_ROUNDS=0).
+CYCLE_ROUNDS = 3
+# Главный аргумент инструмента — по нему определяем повтор, игнорируя служебные поля
+# (session_id, model, limit): один и тот же текст не становится новым делом из-за них.
+TOOL_LOOP_ARGS = ("text", "query", "url", "prompt", "message", "task", "goal", "question")
+
+
+def tool_loop_signature(name: str, args: dict) -> str:
+    """Ключ повтора: инструмент + главный аргумент (первые 300 символов)."""
+    head = ""
+    for key in TOOL_LOOP_ARGS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            head = value.strip()[:300]
+            break
+    return name + ":" + head
+
 
 # Персона явно сообщает модели про инструменты. Без неё локальная модель отвечает
 # «я текстовая нейросеть и не могу отправить картинку», хотя image_generate подключён.
@@ -842,6 +860,7 @@ class App:
         rounds = calls_used = failures = fail_streak = idle_rounds = bad_streak = 0
         continuations = truncations = 0
         seen_calls: Dict[str, Outcome] = {}
+        recent_sigs: List[frozenset] = []   # последние раунды: защита от цикла без лимита раундов
         shown_notes: set = set()          # пояснения о сокращении контекста — один раз за ход
         trace: List[str] = []
         stop_reason = "model_done"
@@ -1072,15 +1091,21 @@ class App:
             # Причина финала определяется ДО запроса к модели: последний вызов
             # всегда делается с явной просьбой дать текст, а не с выбрасыванием tool_call.
             force_stop = ""
-            if not unlimited:
-                if fail_streak >= FAIL_STREAK_LIMIT:
-                    force_stop = "failures"
-                elif bad_streak >= BAD_ROUNDS_LIMIT:
-                    force_stop = "bad_calls"
-                elif idle_rounds >= IDLE_ROUNDS_LIMIT:
-                    # Два раунда подряд модель лишь повторяла уже сделанные вызовы — прогресса нет.
-                    force_stop = "no_progress"
-                elif max_rounds and rounds >= max_rounds:
+            # Эти проверки работают и безлимитном агенте: он всё ещё может вызывать
+            # инструменты сколько угодно раз, но не должен круглить один и тот же набор.
+            if fail_streak >= FAIL_STREAK_LIMIT:
+                force_stop = "failures"
+            elif bad_streak >= BAD_ROUNDS_LIMIT:
+                force_stop = "bad_calls"
+            elif idle_rounds >= IDLE_ROUNDS_LIMIT:
+                # Два раунда подряд модель лишь повторяла уже сделанные вызовы — прогресса нет.
+                force_stop = "no_progress"
+            elif len(recent_sigs) >= CYCLE_ROUNDS and len(set(recent_sigs[-CYCLE_ROUNDS:])) == 1:
+                # Один и тот же набор инструментов три раунда подряд — зацикливание
+                # (например, ingest/facts/graph про одно и то же сообщение).
+                force_stop = "no_progress"
+            if not force_stop and not unlimited:
+                if max_rounds and rounds >= max_rounds:
                     force_stop = "round_limit"
                 elif max_calls and calls_used >= max_calls:
                     force_stop = "call_limit"
@@ -1415,6 +1440,14 @@ class App:
             idle_rounds = 0 if any(it.get("run") for it in items) else idle_rounds + 1
             bad_streak = bad_streak + 1 if items and all(it.get("bad") for it in items) else 0
             fail_streak = fail_streak + 1 if had_error else 0
+            # Подпись раунда по смыслу вызовов (главный аргумент, без служебных полей).
+            # Три одинаковых подписи подряд = зацикливание даже при AGENT_MAX_ROUNDS=0.
+            round_sig = frozenset(tool_loop_signature(it["name"], it.get("args") or {})
+                                  for it in items if not it.get("skipped"))
+            if round_sig:
+                recent_sigs.append(round_sig)
+            else:
+                recent_sigs.clear()
             hint = ""
             if had_error and reflection > 0:
                 reflection -= 1

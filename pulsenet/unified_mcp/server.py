@@ -664,7 +664,8 @@ def build_mcp(cfg: Settings, memories: UserMemories, identity: IdentityStore,
         return {"server": SERVER_NAME, "version": SERVER_VERSION, "user": uid,
                 "admin": is_admin(uid), "code_access": uid in cfg.code_users,
                 "web_backends": web.backends_order(), "searxng_configured": bool(os.getenv("SEARXNG_URL")),
-                "image_backends": images.cfg.backends}
+                "image_backends": images.cfg.backends,
+                "code_roots": sorted(cfg.code_roots)}
 
     return mcp
 

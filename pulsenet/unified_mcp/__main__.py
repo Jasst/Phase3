@@ -24,6 +24,12 @@ def main(argv=None) -> int:
     cmd = argv[0]
     if cmd == "serve":
         import uvicorn
+        from ..memory_service import preload_memory_models
+
+        # VRAM нужен чату: эмбеддер и экстрактор поднимаем на CPU до первого запроса.
+        preloaded = preload_memory_models(cfg.env)
+        if preloaded:
+            print(f"[memory] на CPU загружены: {', '.join(preloaded)}")
         app = create_app(cfg)
         host = os.getenv("PULSENET_UNIFIED_HOST", "127.0.0.1")
         port = int(os.getenv("PULSENET_UNIFIED_PORT", "8010"))

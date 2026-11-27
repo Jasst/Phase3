@@ -56,6 +56,24 @@ def test_garbage_raises_extraction_error_and_extractor_retries_once():
     assert len(calls) == 2
 
 
+def test_empty_llm_answer_gives_actionable_extraction_error(monkeypatch):
+    import pulsenet.triplex.extract as extract_mod
+
+    class Resp:
+        def read(self):
+            return b'{"choices":[{"message":{"content":null}}]}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(extract_mod.urllib.request, "urlopen", lambda *a, **k: Resp())
+    with pytest.raises(ExtractionError, match="TRIPLEX_LLM_MODEL"):
+        extract_mod.openai_chat_caller("http://llm/v1", "vlm-model")("промпт")
+
+
 # ---------- write path ----------
 
 def test_ingest_stores_fact_with_valid_provenance(mem):
@@ -143,6 +161,27 @@ def test_two_strong_candidates_ask_user(mem):
     assert action == "ask" and len(cands) == 2
 
 
+def test_unrelated_phrase_not_linked_by_mid_cosine(mem, monkeypatch):
+    eid = mem._create_entity("pulsenet-unified", "other")
+    monkeypatch.setattr(mem.entity_index, "topk", lambda v, k: [(eid, 0.72)])
+    action, got, _, _ = mem.link_entity("факт только с источником doc_id и span")
+    assert action == "create" and got is None
+
+
+def test_mid_cosine_needs_more_than_one_shared_token(mem, monkeypatch):
+    eid = mem._create_entity("экстракция фактов Phase3", "other")
+    monkeypatch.setattr(mem.entity_index, "topk", lambda v, k: [(eid, 0.72)])
+    action, got, _, _ = mem.link_entity("Проект Phase3")
+    assert action == "create" and got is None
+
+
+def test_different_model_version_not_linked_even_at_strong_cosine(mem, monkeypatch):
+    eid = mem._create_entity("google/gemma-4-26b-a4b-qat возвращает пустой content", "other")
+    monkeypatch.setattr(mem.entity_index, "topk", lambda v, k: [(eid, 0.93)])
+    action, got, _, _ = mem.link_entity("google/gemma-4-e4b")
+    assert action == "create" and got is None
+
+
 # ---------- A3: relations ----------
 
 def test_relation_alias_and_proposal(mem):
@@ -151,6 +190,13 @@ def test_relation_alias_and_proposal(mem):
     canon, how = mem.normalize_relation("ужасно любит")
     assert how == "proposed" and canon == "ужасно любит"
     assert mem.relations[canon]["proposed"] is True
+
+
+def test_negated_relation_is_not_mapped_by_cosine(mem, monkeypatch):
+    mem.define_relation("загружает", aliases=["загружает"])
+    monkeypatch.setattr(mem.rel_index, "topk", lambda v, k: [("загружает", 0.95)])
+    canon, how = mem.normalize_relation("не умеет")
+    assert (canon, how) == ("не умеет", "proposed")
 
 
 # ---------- A5: decay / archive ----------

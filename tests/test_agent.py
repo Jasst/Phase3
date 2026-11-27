@@ -240,6 +240,25 @@ def test_build_extractor_honors_explicit_model(monkeypatch):
     assert seen[-1][1] == "chat/model"                    # модель чата перекрывает .env
 
 
+def test_build_extractor_falls_back_to_env_model(monkeypatch):
+    import pulsenet.memory_service as ms
+
+    seen = []
+
+    def fake_caller(url, model):
+        seen.append(model)
+        if model == "chat/model":
+            raise ms.ExtractionError("пустой ответ")
+        return lambda prompt: '{"facts": [], "entities": []}'
+
+    monkeypatch.setattr(ms, "openai_chat_caller", fake_caller)
+    monkeypatch.setattr(ms, "loaded_chat_model", lambda env: "chat/model")
+    env = {"TRIPLEX_LLM_URL": "http://llm/v1", "TRIPLEX_LLM_MODEL": "env-model"}
+    out = ms.build_extractor(env, model="chat/model")("текст")
+    assert out == {"facts": [], "entities": []}
+    assert seen == ["chat/model", "env-model"]     # загруженная модель не повторяется
+
+
 def test_ingest_uses_one_off_extractor(tmp_path):
     mem = TriplexMemory(str(tmp_path / "m"), encoder=HashEncoder(64))
     mem.extractor = lambda text: (_ for _ in ()).throw(AssertionError("не тот экстрактор"))

@@ -35,8 +35,10 @@ class CodeAccess:
         return None
 
     def _resolve(self, root: str, rel: str) -> tuple:
+        if not self.roots:
+            return None, "CODE_ROOTS не настроен: добавьте NAME=/путь в .env и перезапустите сервер"
         if root not in self.roots:
-            return None, "неизвестный корень"
+            return None, f"неизвестный корень {root!r}; доступны: {', '.join(sorted(self.roots)) or 'нет'}"
         base = self.roots[root]
         full = os.path.realpath(os.path.join(base, rel.lstrip("/\\")))
         if os.path.commonpath([base, full]) != base:

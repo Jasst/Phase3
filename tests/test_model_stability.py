@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """Выбор модели: явный выбор → реально загруженная в LM Studio → .env."""
+from types import SimpleNamespace
+
 import pytest
 
 import pulsenet.llm as llm
@@ -187,3 +189,66 @@ def test_loaded_chat_model_skips_embeddings_and_uses_last_used(monkeypatch):
     monkeypatch.setattr(llm, "http_json", fake_http_json)
     env = {"LMSTUDIO_URL": "http://localhost:1234/v1", "TRIPLEX_LLM_MODEL": "env-model"}
     assert memory_service.loaded_chat_model(env) == "new"
+
+
+def test_only_vlm_loaded_uses_configured_text_model(monkeypatch):
+    def fake_http_json(url, timeout=10):
+        return {"data": [
+            {"id": "emb", "type": "embeddings", "state": "loaded", "last_used": 99},
+            {"id": "vlm", "type": "vlm", "state": "loaded", "last_used": 50},
+        ]}
+
+    monkeypatch.setattr(llm, "http_json", fake_http_json)
+    env = {"LMSTUDIO_URL": "http://localhost:1234/v1", "TRIPLEX_LLM_MODEL": "text-model"}
+    assert memory_service.loaded_chat_model(env) == "text-model"
+
+
+def test_ensure_lmstudio_cpu_loads_missing_model(monkeypatch):
+    calls = []
+    monkeypatch.setattr(memory_service, "loaded_model_ids", lambda env: set())
+    monkeypatch.setattr(memory_service, "_lms_command", lambda: "lms")
+    monkeypatch.setattr(memory_service.subprocess, "run",
+                        lambda *a, **kw: calls.append((a[0], kw)) or
+                        SimpleNamespace(returncode=0, stdout="", stderr=""))
+    assert memory_service.ensure_lmstudio_cpu("emb", {"TRIPLEX_LOCAL_DEVICE": "cpu"}, context=8192)
+    assert calls[0][0] == ["lms", "load", "emb", "--gpu", "off", "-c", "8192", "-y"]
+
+
+def test_ensure_lmstudio_cpu_skips_loaded_and_gpu_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(memory_service, "loaded_model_ids", lambda env: {"emb"})
+    monkeypatch.setattr(memory_service.subprocess, "run",
+                        lambda *a, **kw: calls.append(a[0]))
+    assert not memory_service.ensure_lmstudio_cpu("emb", {"TRIPLEX_LOCAL_DEVICE": "cpu"})
+    assert not memory_service.ensure_lmstudio_cpu("other", {"TRIPLEX_LOCAL_DEVICE": "gpu"})
+    assert calls == []
+
+
+def test_build_extractor_preloads_configured_model_on_cpu(monkeypatch):
+    seen = []
+    monkeypatch.setattr(memory_service, "ensure_lmstudio_cpu",
+                        lambda mid, env, context=8192: seen.append(mid) or True)
+    monkeypatch.setattr(memory_service, "loaded_chat_model", lambda env: "")
+    monkeypatch.setattr(memory_service, "openai_chat_caller",
+                        lambda url, model: (lambda prompt: '{"facts": [], "entities": []}'))
+    env = {"TRIPLEX_LLM_URL": "http://llm/v1", "TRIPLEX_LLM_MODEL": "extract-model",
+           "TRIPLEX_LOCAL_DEVICE": "cpu"}
+    memory_service.build_extractor(env)("текст")
+    assert seen == ["extract-model"]
+
+
+def test_preload_memory_models_loads_embedder_and_extractor(monkeypatch):
+    seen = []
+    monkeypatch.setattr(memory_service, "loaded_model_ids", lambda env: {"other"})
+    monkeypatch.setattr(memory_service, "ensure_lmstudio_cpu",
+                        lambda mid, env, context=8192: seen.append(mid) or True)
+    env = {"TRIPLEX_LOCAL_DEVICE": "cpu", "TRIPLEX_EMBED_MODEL": "bge-m3",
+           "TRIPLEX_LLM_MODEL": "gemma-4-e4b"}
+    assert memory_service.preload_memory_models(env) == ["bge-m3", "gemma-4-e4b"]
+    assert seen == ["bge-m3", "gemma-4-e4b"]
+
+
+def test_preload_memory_models_noop_without_cpu_mode(monkeypatch):
+    monkeypatch.setattr(memory_service, "ensure_lmstudio_cpu",
+                        lambda *a, **kw: pytest.fail("не должно грузиться"))
+    assert memory_service.preload_memory_models({"TRIPLEX_EMBED_MODEL": "bge"}) == []

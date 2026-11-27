@@ -37,6 +37,7 @@ from .thoughts import ThoughtLog, ThoughtState, plan_budget, split_goal
 
 LINK_HI = 0.85       # A2: cos ≥ 0.85 → link
 LINK_LO = 0.70       # A2: 0.70 ≤ cos < 0.85 → link с conf×0.7
+LEX_LINK_MIN = 0.6   # A2: плюс словарное покрытие, иначе бге-подобные эмбеддинги склеивают мусор
 REL_COS = 0.80       # A3: cos ≥ 0.80 → map
 CONF_PRIOR = 0.8     # калибровка: conf = llm_report × 0.8
 THOUGHT_HALF_LIFE_SEC = 15.0   # Phase4: полураспад следа мысли в графе
@@ -68,6 +69,19 @@ def _tokens(text: str) -> List[str]:
         else:
             out.append(tok)
     return out
+
+
+def _lex_overlap(a: str, b: str) -> float:
+    """Покрытие токенами меньшего из двух имён: страховка от ложного link по косинусу."""
+    ta, tb = set(_tokens(a)), set(_tokens(b))
+    return len(ta & tb) / min(len(ta), len(tb)) if ta and tb else 0.0
+
+
+def _same_version(a: str, b: str) -> bool:
+    """Имена с разными версиями/моделями (gemma-4-e4b vs gemma-4-26b) не склеиваются."""
+    va = {t for t in _tokens(a) if any(ch.isdigit() for ch in t)}
+    vb = {t for t in _tokens(b) if any(ch.isdigit() for ch in t)}
+    return not va or not vb or va == vb
 
 
 def _entity_id(canonical: str, etype: str) -> str:
@@ -222,7 +236,8 @@ class TriplexMemory:
             key = r.strip().lower()
             if key in self._rel_alias:
                 return self._rel_alias[key], "known"
-            if self.rel_index.keys:
+            # Отрицание меняет смысл: «не умеет» нельзя приравнять к «загружает» по косинусу.
+            if self.rel_index.keys and not key.startswith(("не ", "не_", "без ")):
                 vec = self.encoder.embed([r.strip()])[0]
                 top = self.rel_index.topk(vec, 1)
                 if top and top[0][1] >= REL_COS:
@@ -260,13 +275,17 @@ class TriplexMemory:
                     continue
                 if self._type_compat(etype, self.entities[e]["type"]):
                     cands.append((e, cos))
-            strong = [c for c in cands if c[1] >= LINK_HI]
+            strong = [c for c in cands if c[1] >= LINK_HI
+                      and _same_version(name, self.entities[c[0]]["canonical"])]
             if len(strong) >= 2:
                 return "ask", None, 1.0, [{"entity_id": e, "canonical": self.entities[e]["canonical"],
                                            "cos": round(c, 3)} for e, c in strong]
             if len(strong) == 1:
                 return "link", strong[0][0], 1.0, []
-            mid = [c for c in cands if LINK_LO <= c[1] < LINK_HI]
+            mid = [c for c in cands
+                   if LINK_LO <= c[1] < LINK_HI
+                   and _same_version(name, self.entities[c[0]]["canonical"])
+                   and _lex_overlap(name, self.entities[c[0]]["canonical"]) >= LEX_LINK_MIN]
             if mid:
                 return "link", mid[0][0], 0.7, []
             return "create", None, 1.0, []

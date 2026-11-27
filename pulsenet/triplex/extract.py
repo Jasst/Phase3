@@ -116,5 +116,10 @@ def openai_chat_caller(base_url: str, model: str, timeout: float = 120.0,
                                      method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"] or ""
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+        if not content:
+            raise ExtractionError(
+                f"модель {model!r} вернула пустой ответ: загрузите текстовую LLM "
+                f"или укажите TRIPLEX_LLM_MODEL")
+        return content
     return call
