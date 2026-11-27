@@ -32,6 +32,7 @@ from .docstore import DocStore
 from .encoder import HashEncoder
 from .index import LSHIndex, VectorIndex, rrf
 from .journal import ConflictError, Fact, FactJournal
+from .noise import is_noise_entity, noise_reason  # реэкспорт: совместимо с импортом из memory
 from .thoughts import ThoughtLog, ThoughtState, plan_budget, split_goal
 
 LINK_HI = 0.85       # A2: cos ≥ 0.85 → link
@@ -138,6 +139,13 @@ class TriplexMemory:
             if rec["alias"] not in ent["aliases"]:
                 ent["aliases"].append(rec["alias"])
             self._alias_to_entity.setdefault(rec["alias"].lower(), rec["entity_id"])
+        elif rec["op"] == "entity_noise":          # чистка старого графа: узел больше не связывается
+            ent = self.entities.get(rec["entity_id"])
+            if ent is not None:
+                ent["noisy"] = True
+                for a in [ent["canonical"]] + list(ent.get("aliases", [])):
+                    if self._alias_to_entity.get(a.lower()) == rec["entity_id"]:
+                        self._alias_to_entity.pop(a.lower(), None)
         elif rec["op"] == "relation":
             canon = rec["canonical"]
             old = self.relations.get(canon, {})
@@ -240,13 +248,16 @@ class TriplexMemory:
         with self._lock:
             key = name.strip().lower()
             eid = self._alias_to_entity.get(key)
-            if eid and self._type_compat(etype, self.entities[eid]["type"]):
+            if (eid and not self.entities[eid].get("noisy")
+                    and self._type_compat(etype, self.entities[eid]["type"])):
                 return "link", eid, 1.0, []
             if not self.entity_index.keys:
                 return "create", None, 1.0, []
             vec = self.encoder.embed([name.strip()])[0]
             cands = []
             for e, cos in self.entity_index.topk(vec, 8):
+                if self.entities[e].get("noisy"):
+                    continue
                 if self._type_compat(etype, self.entities[e]["type"]):
                     cands.append((e, cos))
             strong = [c for c in cands if c[1] >= LINK_HI]
@@ -342,11 +353,21 @@ class TriplexMemory:
                 out["error"] = str(exc)
                 return out
 
-            types = {e["name"].lower(): e["type"] for e in extracted.get("entities", [])}
+            types = {e["name"].lower(): e["type"] for e in extracted.get("entities", [])
+                     if not is_noise_entity(e["name"])}
             valid_from = doc.recorded_at
             for f in extracted.get("facts", []):
                 a = doc.text.find(f["evidence"])
                 if a < 0:                                     # защита повторно: span из текста
+                    continue
+                # Шум экстракции не должен становиться узлом: иначе «ты» склеивает
+                # несвязанные факты в один хаб и портит активационные пути.
+                s_noise, o_noise = noise_reason(f["s"]), noise_reason(f["o"])
+                if s_noise or o_noise:
+                    out["facts"].append({"status": "rejected_noise",
+                                         "message": "шумная сущность",
+                                         "reason": s_noise or o_noise,
+                                         "fact": {"s": f["s"], "r": f["r"], "o": f["o"]}})
                     continue
                 span = [a, a + len(f["evidence"])]
                 s_act, s_id, s_cf, s_c = self.link_entity(f["s"], types.get(f["s"].lower()))
@@ -633,6 +654,12 @@ class TriplexMemory:
                 items.append({"fact_id": fid, "valence": max(-1.0, min(1.0, vv)), "reason": reason})
                 ids.append(fid)
             ids = list(dict.fromkeys(ids))
+            if items:
+                # Один факт — один verdict за мысль: иначе boost складывается дважды.
+                by_fid: Dict[str, dict] = {}
+                for item in items:
+                    by_fid.setdefault(item["fact_id"], item)
+                items = list(by_fid.values())
             if not ids and not items:
                 return {"status": "rejected", "message": "нужны fact_ids или verdicts"}
             if v is None and not items:
@@ -748,6 +775,12 @@ class TriplexMemory:
         индекс факта. Раньше инструмент писал в журнал напрямую: сущности не связывались,
         факт не попадал в поиск до перезапуска, дубли не отсекались."""
         with self._lock:
+            s_noise, o_noise = noise_reason(s_name), noise_reason(o_name)
+            if s_noise or o_noise:
+                return {"status": "rejected_noise",
+                        "message": "сущность похожа на местоимение, общее слово или обрывок фразы; "
+                                   "назовите конкретный объект",
+                        "reason": s_noise or o_noise}
             s_act, s_id, s_cf, s_c = self.link_entity(s_name)
             o_act, o_id, o_cf, o_c = self.link_entity(o_name)
             if "ask" in (s_act, o_act):
@@ -786,6 +819,34 @@ class TriplexMemory:
         with self._lock:
             return self.journal.retract(fact_id, at=at)     # KeyError для неизвестного факта
 
+    def clean_noise(self, dry_run: bool = True) -> dict:
+        """Разовая чистка шумных сущностей, попавших в граф до включения фильтра.
+
+        По умолчанию только доклад (dry_run=True): журнал остаётся append-only,
+        поэтому даже при реальной чистке факты не удаляются, а отзываются (I3).
+        Узлы помечаются как шумные записью meta ``entity_noise`` и перестают
+        участвовать в link_entity.
+        """
+        with self._lock:
+            retracted = []
+            for f in self.journal.query():
+                s, o = self._ename(f.s), self._ename(f.o)
+                reasons = [r for r in (noise_reason(s), noise_reason(o)) if r]
+                if reasons:
+                    retracted.append({"fact_id": f.fact_id, "text": self._fact_text(f),
+                                      "reasons": reasons})
+            marked = []
+            for eid, ent in self.entities.items():
+                reason = noise_reason(ent["canonical"])
+                if reason and not ent.get("noisy"):
+                    marked.append({"entity_id": eid, "name": ent["canonical"], "reason": reason})
+            if not dry_run:
+                for item in retracted:
+                    self.journal.retract(item["fact_id"])
+                for item in marked:
+                    self._write_meta({"op": "entity_noise", "entity_id": item["entity_id"]})
+            return {"dry_run": bool(dry_run), "retracted": retracted, "entities_marked": marked}
+
     def agent_of(self, f: Fact) -> str:
         """Агент-автор факта: из source.agent, иначе из документа-источника."""
         if f.source.get("agent"):
@@ -811,6 +872,7 @@ class TriplexMemory:
                 "docs": len(self.docs.docs),
                 "chunks": len(self.chunk_index),
                 "entities": len(self.entities),
+                "entities_noisy": sum(1 for e in self.entities.values() if e.get("noisy")),
                 "relations": len(self.relations),
                 "relations_proposed": sum(1 for r in self.relations.values() if r["proposed"]),
                 "facts_records": len(self.journal.facts),

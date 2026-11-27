@@ -46,6 +46,8 @@ ACT_MEMORY = 0.70
 BOOST_HALF_LIFE_SEC = 600.0   # 10 мин: подкрепление не должно навсегда закреплять факт в лидерах
 BOOST_USAGE_WEIGHT = 0.5      # вклад boost в usage меньше, чем вклад реальных обращений
 BOOST_USAGE_CAP = 0.30        # потолок надбавки к весу ребра от usage
+# Лишнее звено с активацией ниже доли слабого звена пути — это не гипотеза, а шум.
+PATH_SUBSET_ACT_RATIO = 0.5
 
 
 @dataclass
@@ -192,6 +194,32 @@ def _path_score(ids: List[str], act: Dict[str, float], rmatch: Dict[str, float],
     return round(base * (0.6 + 0.4 * match), 6)
 
 
+def _collapse_weak_supersets(paths: List[dict], act: Dict[str, float]) -> List[dict]:
+    """Убрать пути, которые лишь добавляют к другому пути слабое звено.
+
+    ``[a, b]`` и ``[c, a, b]`` — разные по длине, но для интерфейса и обратной
+    связи это один и тот же след, если c почти не активирован. Сильно
+    активированное звено оставляет путь отдельной гипотезой. Primary никогда
+    не удаляется: старый контракт path → UI должен оставаться стабильным.
+    """
+    by_len = sorted(paths, key=lambda p: (len(p["ids"]), p["ids"]))
+    drops: set = set()
+    for i, small in enumerate(by_len):
+        small_ids = set(small["ids"])
+        baseline = [act.get(fid, 0.0) for fid in small_ids]
+        if not baseline:
+            continue
+        floor = PATH_SUBSET_ACT_RATIO * min(baseline)
+        for big in by_len[i + 1:]:
+            big_ids = set(big["ids"])
+            if not small_ids < big_ids or big.get("reason") == "primary":
+                continue
+            extra = big_ids - small_ids
+            if max(act.get(fid, 0.0) for fid in extra) < floor:
+                drops.add(id(big))
+    return [p for p in paths if id(p) not in drops]
+
+
 def _alternatives(act: Dict[str, float], parents: Dict[str, str],
                   parent_candidates: Dict[str, List[str]], primary: List[str],
                   rmatch: Dict[str, float], by_id: Dict[str, Fact],
@@ -203,20 +231,26 @@ def _alternatives(act: Dict[str, float], parents: Dict[str, str],
     собираются из вторых best-родителей и соседних по активации концов,
     поэтому они реально существуют в графе, а не выдуманы.
     """
-    scored: Dict[Tuple[str, ...], dict] = {}
+    # Ключ — множество звеньев: [a, b] и [b, a] один путь для оценки и обратной
+    # связи. representative остаётся лучшим по score, но primary не перетирается.
+    scored: Dict[frozenset, dict] = {}
 
     def add(ids: List[str], reason: str) -> None:
         if len(ids) < 2:
             return
-        key = tuple(ids)
-        if key in scored:
-            return
-        scored[key] = {
+        key = frozenset(ids)
+        cand = {
             "ids": list(ids),
             "score": _path_score(ids, act, rmatch, by_id),
             "reason": reason,
             "activation": round(act.get(ids[-1], 0.0), 4),
         }
+        old = scored.get(key)
+        if (old is None or reason == "primary"
+                or (old["reason"] != "primary"
+                    and (-cand["score"], len(cand["ids"]), cand["ids"])
+                    < (-old["score"], len(old["ids"]), old["ids"]))):
+            scored[key] = cand
 
     add(primary, "primary")
     ends = sorted(act, key=lambda fid: (-act[fid], fid))[:max(2, min(beam + 1, 8))]
@@ -229,13 +263,12 @@ def _alternatives(act: Dict[str, float], parents: Dict[str, str],
         alt[fid] = options[1]
         for end in ends[:2]:
             ids = _reconstruct(alt, end)
-            if set(ids) != set(primary) or ids != primary:
-                add(ids, "alternate_parent")
+            add(ids, "alternate_parent")
 
     ordered = sorted(scored.values(), key=lambda p: (-p["score"], p["ids"]))
+    ordered = _collapse_weak_supersets(ordered, act)
     # primary остаётся первым даже если его оценки чуть ниже — это обратная совместимость.
-    prim_key = tuple(primary)
-    ordered.sort(key=lambda p: 0 if tuple(p["ids"]) == prim_key else 1)
+    ordered.sort(key=lambda p: 0 if p["reason"] == "primary" else 1)
     paths = ordered[:max(1, min(beam + 1, 6))]
     alternatives = paths[1:]
 
@@ -407,8 +440,18 @@ def apply_valence(mem, ordered_fact_ids: Sequence[str], valence: float,
     v = max(-1.0, min(1.0, float(valence)))
     if not v or not ordered_fact_ids:
         return []
+    # Один факт = один кредит за мысль, даже если он попал в несколько путей
+    # (основной и альтернативный) или передан вызывающим кодом дважды.
+    seen: set = set()
+    ordered: List[str] = []
+    for raw in ordered_fact_ids:
+        fid = str(raw)
+        if fid in seen:
+            continue
+        seen.add(fid)
+        ordered.append(fid)
     updates: List[Tuple[str, float]] = []
-    for i, fid in enumerate(reversed(list(ordered_fact_ids))):
+    for i, fid in enumerate(reversed(ordered)):
         amount = ACT_REINFORCE * v * (ACT_MEMORY ** i)
         if abs(amount) < 0.0005:
             break

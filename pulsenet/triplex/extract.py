@@ -16,6 +16,8 @@ import re
 import urllib.request
 from typing import Callable, Dict, List, Optional
 
+from .noise import noise_reason
+
 ENTITY_TYPES = ("person", "animal", "object", "place", "organization", "concept", "other")
 
 PROMPT = """Извлеки факты из текста. Верни ТОЛЬКО JSON без пояснений и без markdown.
@@ -60,6 +62,8 @@ def parse_extraction(raw: str, text: str) -> Dict[str, List[dict]]:
     for e in data.get("entities") or []:
         if not isinstance(e, dict) or not isinstance(e.get("name"), str) or not e["name"].strip():
             continue
+        if noise_reason(e["name"]):                 # шум не становится даже кандидатом в узел
+            continue
         etype = e.get("type") if e.get("type") in ENTITY_TYPES else "other"
         entities.append({"name": e["name"].strip(), "type": etype})
 
@@ -69,6 +73,8 @@ def parse_extraction(raw: str, text: str) -> Dict[str, List[dict]]:
             continue
         s, r, o, ev = (f.get(k) for k in ("s", "r", "o", "evidence"))
         if not all(isinstance(x, str) and x.strip() for x in (s, r, o, ev)):
+            continue
+        if noise_reason(s) or noise_reason(o):
             continue
         if ev not in text:              # дословная проверка: иначе span невалиден
             continue
